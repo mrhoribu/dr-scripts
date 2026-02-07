@@ -1,7 +1,6 @@
 =begin
   Documentation: https://elanthipedia.play.net/Lich_script_repository#mm
 =end
-custom_require.call(%w[common-arcana common-moonmage events])
 
 class MoonMagery
   def initialize
@@ -92,7 +91,7 @@ class MoonMagery
         return false
       end
       lines = lines[index..-1]
-      line = lines.find { |each_line| each_line =~ /^\[.*\]$/ }
+      line = lines.find { |each_line| each_line =~ /(?<roomtitle>\[.*?\])(?:\s\((?<uid>\d+)\))?/ }
       index = lines.find_index(line)
       room_description = lines[index + 1]
       room_data = Room.list.find { |room| room.description.find { |item| item =~ /#{room_description.split('.').first}/i } }

@@ -1,7 +1,5 @@
 #   Documentation: https://elanthipedia.play.net/Lich_script_repository#bescort
 
-custom_require.call(%w[common common-arcana common-items common-travel common-money common-moonmage drinfomon equipmanager events skill-recorder])
-
 $turns_since_bad = 0
 
 class MazeRoom
@@ -120,7 +118,7 @@ class Bescort
       ],
       [
         { name: 'ways', regex: /ways/i, description: 'Astral travelling' },
-        { name: 'mode', options: %w[shard crossing leth riverhaven merkresh fang raven throne muspari aesry taisgath theren steppes], description: 'Where do you need to get to?' }
+        { name: 'mode', options: %w[aesry crossing fang leth merkresh muspari raven riverhaven shard steppes taisgath theren throne velatohr], description: 'Where do you need to get to?' }
       ],
       [
         { name: 'mammoth', regex: /mammoth/i, description: 'The mammoths between Acenamacra, Fang Cove, and Ratha' },
@@ -150,7 +148,11 @@ class Bescort
         { name: 'mode', options: %w[totheren torossman], description: 'Where do you need to get to?' }
       ],
       [
-        { name: 'gondola', regex: /gondola/i, description: 'Gondola between Shard and Leth Deriel' },
+        { name: 'gondola', regex: /^gondola$/i, description: 'Gondola between Shard and Leth Deriel' },
+        { name: 'mode', options: %w[north south], description: 'Which direction are you going?' }
+      ],
+      [
+        { name: 'fly_under_gondola', regex: /^fly_under_gondola$/i, description: 'Fly over the obstacles under the gondola between Shard and Leth Deriel' },
         { name: 'mode', options: %w[north south], description: 'Which direction are you going?' }
       ],
       [
@@ -230,6 +232,9 @@ class Bescort
       ],
       [
         { name: 'coffin', regex: /coffin/i, description: "Enter the abyss via coffin for lanky grey lachs, et al." }
+      ],
+      [
+        { name: 'eluned', regex: /eluned/i, description: "Enter the Crystal Cavern of Eluned." }
       ]
     ]
 
@@ -280,6 +285,8 @@ class Bescort
       take_theren_rope_bridge(args.mode)
     elsif args.gondola
       ride_gondola(args.mode)
+    elsif args.fly_under_gondola
+      fly_under_gondola(args.mode)
     elsif args.sandbarge
       take_sandbarge(args.start_location, args.end_location)
     elsif args.desert
@@ -322,6 +329,8 @@ class Bescort
       asketis_mount(args.mode)
     elsif args.coffin
       coffin
+    elsif args.eluned
+      crystal_cavern_of_eluned
     end
   end
 
@@ -350,6 +359,15 @@ class Bescort
           exit
         end
         DRC.bput("command #{type} to #{speed}", /You command your/)
+      when /phoenix feather/i # This section is for https://elanthipedia.play.net/Item:Phoenix_feather_strung_upon_a_burning_goldfyre_chain_set_with_anloral_beads
+        DRCI.remove_item?(@flying_mount_item)
+        DRCI.get_item_if_not_held?(@flying_mount_item)
+        case DRC.bput("light my #{@flying_mount_item}", /You reverently cradle a phoenix feather/, /What were you referring to/)
+        when /What were you referring/
+          DRC.message("Can't mount your #{type}, where is it?")
+          exit
+        end
+        DRC.bput("command phoenix to #{speed}", /You signal the starfire phoenix to speed up/)
       when /cloud/i # This section is for mounts with different nouns than their activating item. May need to add more activation matches.
         DRCI.remove_item?(@flying_mount_item)
         DRCI.get_item_if_not_held?(@flying_mount_item)
@@ -372,6 +390,11 @@ class Bescort
         DRC.bput('dismount', /Your .* floats down to the ground/, /You climb off/)
         DRC.bput("roll #{type}", /You roll up/, /You can't roll/)
         DRCI.put_away_item?(type)
+      when /phoenix feather/i
+        DRC.bput("snuff phoenix", /You beseech Murrula's grace as you beckon/)
+        DRCI.wear_item?(@flying_mount_item)
+        DRCI.put_away_item?(@flying_mount_item) if checkright
+        DRCI.put_away_item?(@flying_mount_item) if checkleft
       when /cloud/i
         DRC.bput("#{@flying_mount_dismount} #{type}", /With a gesture,/)
         DRCI.wear_item?(@flying_mount_item)
@@ -435,6 +458,7 @@ class Bescort
           dseen = true
           break
         end
+        DRC.bput("pull rope", /^You grasp onto the woven rope and heave downward with all your might/)
       end
 
       # Light tapestry
@@ -445,6 +469,7 @@ class Bescort
           lseen = true
           break
         end
+        DRC.bput("pull rope", /^You grasp onto the woven rope and heave downward with all your might/)
       end
 
       # Back to coffin
@@ -1107,13 +1132,13 @@ class Bescort
       return
     end
 
-    if UserVars.athletics >= 140
-      unless UserVars.athletics >= 300
+    if DRSkill.getmodrank('Athletics') >= 140
+      unless DRSkill.getmodrank('Athletics') >= 300
         @equipment_manager.empty_hands
         @equipment_manager.wear_equipment_set?('swimming')
       end
       swim_faldesu(mode =~ /haven/i)
-      @equipment_manager.wear_equipment_set?('standard') unless UserVars.athletics >= 300
+      @equipment_manager.wear_equipment_set?('standard') unless DRSkill.getmodrank('Athletics') >= 300
     else
       take_rh_ferry(mode =~ /haven/i)
     end
@@ -1136,7 +1161,7 @@ class Bescort
     if @flying_mount
       move_fast = true
       case @flying_mount
-      when /broom|dirigible|carpet|rug/i
+      when /broom|dirigible|carpet|rug|phoenix feather/i
         use_flying_mount(@flying_mount, 'mount', 'glide')
       when /cloud/i
         use_flying_mount(@flying_mount, 'mount', 'drift')
@@ -1224,7 +1249,12 @@ class Bescort
     manual_go2(start)
     moveset = north ? %w[north northwest northeast] : %w[south southwest southeast]
     if @flying_mount
-      use_flying_mount(@flying_mount, 'mount')
+      case @flying_mount
+      when /phoenix feather/i
+        use_flying_mount(@flying_mount, 'mount', 'streak')
+      else
+        use_flying_mount(@flying_mount, 'mount')
+      end
       move 'go river'
       if north
         move n
@@ -1536,6 +1566,8 @@ class Bescort
         use_flying_mount(@flying_mount, 'mount', 'skim')
       when /cloud/i
         use_flying_mount(@flying_mount, 'mount', 'hover')
+      when /phoenix feather/i
+        use_flying_mount(@flying_mount, 'mount', 'fly')
       else
         DRC.message("#{@flying_mount} is not a valid type of flying mount.")
         exit
@@ -1765,19 +1797,20 @@ class Bescort
     Flags.add('walking-circles', "You end up walking in circles")
 
     room_id_to_shard = {
-      9999 => "Asharshpar'i",
-      607  => 'Rolagi',
-      2493 => 'Marendin',
-      306  => 'Taniendar',
-      3002 => 'Mintais',
-      3105 => 'Dinegavren',
-      4542 => 'Tamigen',
-      5050 => 'Erekinzil',
-      6867 => 'Auilusi',
-      8302 => 'Vellano',
-      3777 => "Dor'na'torna",
-      287  => 'Tabelrem',
-      6991 => 'Besoge'
+      9999  => "Asharshpar'i",
+      607   => 'Rolagi',
+      2493  => 'Marendin',
+      306   => 'Taniendar',
+      3002  => 'Mintais',
+      3105  => 'Dinegavren',
+      4542  => 'Tamigen',
+      5050  => 'Erekinzil',
+      6867  => 'Auilusi',
+      8302  => 'Vellano',
+      3777  => "Dor'na'torna",
+      287   => 'Tabelrem',
+      6991  => 'Besoge',
+      51786 => 'Aevargwem'
     }
 
     mode_to_shard = {
@@ -1793,7 +1826,8 @@ class Bescort
       'fang'       => 'Vellano',
       'muspari'    => 'Tabelrem',
       'steppes'    => "Dor'na'torna",
-      'merkresh'   => 'Besoge'
+      'merkresh'   => 'Besoge',
+      'velatohr'   => 'Aevargwem'
     }
 
     mode_to_pillar_roomid = {
@@ -1809,7 +1843,8 @@ class Bescort
       'theren'     => 9762,
       'riverhaven' => 9762,
       'throne'     => 9808,
-      'taisgath'   => 9808
+      'taisgath'   => 9808,
+      'velatohr'   => 9804
     }
 
     direction_to_pattern = {
@@ -1841,7 +1876,24 @@ class Bescort
     fput('rel mana')
   end
 
+  # Waits for and rides the gondola to the other platform.
   def ride_gondola(mode)
+    north_platform_room_id = 2249
+    south_platform_room_id = 2904
+
+    case mode.downcase
+    when /north/
+      unless Room.current.id == south_platform_room_id
+        echo("Must start at the south platform, room number #{south_platform_room_id}, to ride the gondola north")
+        exit
+      end
+    when /south/
+      unless Room.current.id == north_platform_room_id
+        echo("Must start at the north platform, room number #{north_platform_room_id}, to ride the gondola south")
+        exit
+      end
+    end
+
     case DRC.bput('go gondola', 'There is no wooden gondola here', 'Gondola, Cab')
     when /no wooden gondola here/i
       DRC.bput('look gondola', 'The wooden gondola')
@@ -1852,8 +1904,57 @@ class Bescort
       move mode
       hide?
       waitfor 'With a soft bump, the gondola comes to a stop at its destination'
-      move 'out'
+      pause 0.5
+      move 'out' unless [2249, 2904].include?(Room.current.id)
     end
+  end
+
+  # Uses a flying mount to bypass the athletics checks so you
+  # can take the shortcut under the gondola to the other side.
+  def fly_under_gondola(mode)
+    north_start_room_id = 2245  # on road north of gondola at branch
+    south_start_room_id = 19466 # under gondola at southside of the log
+
+    case mode.downcase
+    when /north/
+      unless Room.current.id == south_start_room_id
+        echo("Must start under gondola at southside of the log, room number #{south_start_room_id}, to fly under the gondola north")
+        exit
+      end
+      moveset = [
+        'go log',
+        'go embankment',
+        'southwest',
+        'south',
+        'down',
+        'go wall',
+        'go ledge',
+        'go niche',
+        'go branch'
+      ]
+    when /south/
+      unless Room.current.id == north_start_room_id
+        echo("Must start on road north of gondola at the branch, room number #{north_start_room_id}, to fly under the gondola south")
+        exit
+      end
+      moveset = [
+        'go branch',
+        'go niche',
+        'go ledge',
+        'go wall',
+        'up',
+        'north',
+        'northeast',
+        'go embankment',
+        'go log'
+      ]
+    end
+
+    # Set speed to slow so that we go one room at a time
+    # and don't mistakenly run down other paths.
+    use_flying_mount(@flying_mount, 'mount', 'slow')
+    moveset.each { |dir| move(dir) }
+    use_flying_mount(@flying_mount, 'dismount')
   end
 
   def take_xing_ferry(mode)
@@ -1874,7 +1975,8 @@ class Bescort
     when 'You hand him', 'The Captain gives you a little nod'
       hide?
       waitfor 'reaches the dock and its crew ties the ferry off'
-      move 'go dock'
+      pause 0.5
+      move 'go dock' unless [1904, 957].include?(Room.current.id)
     when 'The ferry has just pulled away from the dock', 'There is no ferry here to go aboard'
       pause 1 while DRRoom.room_objs.find { |x| x =~ /the ferry/ }
       take_xing_ferry(mode)
@@ -2031,9 +2133,27 @@ class Bescort
 
   def enter_thief_guild
     password = @settings.shard_thief_password
-    DRC.bput('knock', 'You knock on the door')
-    DRC.bput("say #{password}", 'You lean towards the doorway')
-    move 'go door'
+    case DRC.bput('knock', /^You wait, but nothing happens/, /^A moment later, a slit opens in the door at eye level/)
+    when /^A moment later, a slit opens in the door at eye level/
+      case DRC.bput("say #{password}", 'You lean towards the doorway', /^You say/)
+      when /^You say/
+        DRC.message("fix yer yaml ye grub! Yer password is wrong!")
+        DRC.message("Set the correct value for shard_thief_password")
+        stop_script("go2") if Script.running?("go2")
+        exit
+      end
+    end
+    case DRC.bput('go door', /From behind the doorway you hear a faint chuckle/, /Obvious exits/)
+    when /From behind the doorway you hear a faint chuckle/
+      case DRC.bput("say #{password}", 'You lean towards the doorway', /^You say/)
+      when /^You say/
+        DRC.message("fix yer yaml ye grub! Yer password is wrong!")
+        DRC.message("Set the correct value for shard_thief_password")
+        stop_script("go2") if Script.running?("go2")
+        exit
+      end
+      move 'go door'
+    end
   end
 
   def use_shard_gates
@@ -2053,6 +2173,15 @@ class Bescort
       DRC.release_invisibility
       DRC.bput('knock gate', 'You knock')
     end
+  end
+
+  def crystal_cavern_of_eluned
+    unless [1192, 51789].include?(Room.current.id)
+      echo 'You are not at the Crystal Cavern of Eluned entrance'
+      return
+    end
+    fput 'meditate'
+    waitfor 'Your simple world explodes into a torrent of color'
   end
 
   def get_fare?(amount, town, room)

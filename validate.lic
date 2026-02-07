@@ -1,5 +1,3 @@
-custom_require.call(%w[common drinfomon])
-
 class DRYamlValidator
   def initialize
     arg_definitions = [[
@@ -107,6 +105,12 @@ class DRYamlValidator
     warn('You have no weapons configured in weapon_training: this will likely cause problems.')
   end
 
+  def assert_that_dual_load_and_charged_maneuvers_bows_do_not_coexist(settings)
+    return unless settings.dual_load && settings.charged_maneuvers.has_key?('Bow')
+
+    error('dual_load: true is not compatible with using charged_maneuvers with Bows!  Set dual_load to false or configure charged_maneuvers without Bows')
+  end
+
   def assert_that_cyclic_no_release_spell_is_invalid_unless_listed_in_base_spells(settings)
     return if !settings.cyclic_no_release
 
@@ -211,7 +215,7 @@ class DRYamlValidator
     valid_hometown_altars = get_data('theurgy')[settings.hometown]['favor_altars'].keys
     return if valid_hometown_altars.include?(settings.favor_god.capitalize)
 
-    warn("The favor_god: #{settings.favor_god} you have set does not have a favor altar in your hometown: #{settings.hometown}.  You will not be able to get favors if you fall below your favor_goal.")
+    warn("The favor_god: #{settings.favor_god} you have set does not have a favor altar in your hometown: #{settings.hometown}.  You will not be able to get favors if you fall below your favor_goal. Consider setting a favor_town where #{settings.favor_god} does have an altar.")
   end
 
   def assert_that_water_holder_is_set_when_using_altars(settings)
@@ -347,7 +351,8 @@ class DRYamlValidator
     settings.hunting_info
             .select { |info| info[:duration].nil? }
             .select { |info| info['stop_on'].nil? }
-            .each { |info| error("Must have at least one of :duration or stop_on for hunting_info '#{info[:zone]}'") }
+            .select { |info| info['stop_on_low'].nil? }
+            .each { |info| error("Must have at least one of :duration or stop_on or stop_on_low for hunting_info '#{info[:zone]}'") }
   end
 
   def assert_that_priority_skills_exists_if_hunting_priority(settings)

@@ -177,6 +177,7 @@ charged_maneuvers:
   Staves: twirl
   Polearms: impale
   Dual Wield: doublestrike
+  Shield Usage: rush
 
 # If "Charged Maneuver" is set in your training_abilities, this setting
 # will attempt doublestrikes by temporarily wielding a "doublestrike trainable"
@@ -234,6 +235,19 @@ stomp_to_engage: false
 pounce_on_cooldown: false
 # Toggle use of Pounce to engage (when it is available)
 pounce_to_engage: false
+# Toggle use of Maneuver Rush to engage (when it is available)
+maneuver_rush_to_engage: false
+# If "Charged Maneuver" is set in your training_abilities, or
+# `pounce_to_engage: true`, this setting determines which shield you will
+# equip to your offhand to rush to engage enemies with.
+# This can be the same as your arm-worn shield, or perhaps a larger one
+# that you pull out of a container just for this maneuver.
+# This must match the "{adjective} {noun}" of the same item in your gear: section.
+maneuver_rush_shield:
+# Set to true to avoid retreating if already at melee.
+maneuver_rush_skip_retreat: false
+maneuver_rush_engage_only: false
+
 
 # Defines the number of monsters you will keep in combat with you by performing 'dance actions' or attacking with only 'harmless: true' spells. 0 means kill everything.
 dance_threshold: 0
@@ -693,6 +707,10 @@ check_discern_timer_in_hours: 24 # i.e., checking every 24 hours
 # Thief only - kneel to activate khri
 # With sufficient skill, you can activate while standing
 kneel_khri: false
+# Thief only - use khri adaptation
+# Can use PUNCTURE, SLICE, IMPACT, FIRE, COLD, or ELECTRIC, delay type or type
+# delay slice, slice, etc
+khri_adaptation:
 # Barbarian only - kneel to activate barbarian meditation
 # With the Yogi mastery, you can meditate while standing
 sit_to_meditate: false
@@ -1099,6 +1117,8 @@ caravan_training_skills:
   # Engineering: 200
 # recipe overrides for shaping and outfitting (knitting only still). If defined, and above circle 35, this will be used to turn in completed goods for workorders. See wiki above.
 caravan_recipes:
+# Do you want to use Trading tasks while delivering contracts?
+trade_tasks: true
 
 # Lumber settings
 forests_to_chop:
@@ -2086,6 +2106,9 @@ restock_shop:
 # The noun of your almanac (e.g. almanac, tome, treatise, monograph, etc)
 almanac_noun: almanac
 
+# report when used on usage details - skill selected, and mindstates gained
+almanac_report_details: false
+
 # Wait this many seconds before reading almanac
 almanac_startup_delay: 15
 
@@ -2828,3 +2851,22 @@ script_watch_script_argument_separator: " - "
 script_watch_argument_prefix: "&lt;"
 script_watch_argument_postfix: "&gt;"
 script_watch_argument_separator: ", "
+
+#capture-critter.lic settings
+capture_critter_settings:
+    # List of items to dispose of
+    junk:
+      - sharkskin
+    # Where to store rewards\prizes for turning in captured critters
+    reward_container: 
+    # Optional custom game settings, if base-capture.yaml is out of date. Should match the format of an entry in base-capture.yaml
+    custom: 
+      # Room number where you return the critter
+      return_room: 
+      # Surface you put the critter on
+      return_surface: 
+      # Rooms where the critters spawn
+      room_list: []
+      # Names of capturable critters
+      critter_names: []
+    debug: false

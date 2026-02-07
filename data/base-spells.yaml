@@ -13,33 +13,35 @@ charge_messages:
 - Something in the area is interfering with your magical senses.
 
 invoke_messages:
-- Images of streaking stars falling from the heavens flash
-- You reach for its center
-- Your link to the
-- shows signs of having been charged
-- You are in no condition to do that
-- intact
-- almost magically null
-- Kneeling down, you draw the spell pattern's shadow with
-- You draw the spell pattern's shadow with
-- You make sweeping gestures through the air
-- You lift your \w+ (?:toward|reverently)
-- You reach for their centers
-- Closing your eyes
-- Well, that was fun
-- Invoke what
-- You'll have to hold it
-- you find it too clumsy to invoke
-- You raise the (\w+) up, and a (\w+) glow surrounds it
-- You prick your finger with the tip of your athame
-- Something in the area is interfering with the magical device.
-- You make a series of cryptic fluttering motions
-- You make a series of slicing motions
-- You make some subtle swaying gestures
-- You make dramatic swooping gestures
-- You mutter unintelligibly beneath your breath while you twirl
-- You stare intently at your
-- You pluck one of the cracked rubies
+  - Before you in a contemplative posture
+  - Closing your eyes
+  - Images of streaking stars falling from the heavens flash
+  - Invoke what
+  - Kneeling down, you draw the spell pattern's shadow with
+  - Something in the area is interfering with the magical device.
+  - Well, that was fun
+  - You are in no condition to do that
+  - You draw the spell pattern's shadow with
+  - You gently brush your finger against
+  - You lift your \w+ (?:toward|reverently)
+  - You make a series of cryptic fluttering motions
+  - You make a series of slicing motions
+  - You make dramatic swooping gestures
+  - You make some subtle swaying gestures
+  - You make sweeping gestures through the air
+  - You mutter unintelligibly beneath your breath while you twirl
+  - You pluck one of the cracked rubies
+  - You prick your finger with the tip of your athame
+  - You raise the (\w+) up, and a (\w+) glow surrounds it
+  - You reach for its center
+  - You reach for their centers
+  - You stare intently at your
+  - You'll have to hold it
+  - Your link to the
+  - almost magically null
+  - intact
+  - shows signs of having been charged
+  - you find it too clumsy to invoke
 
 prep_messages:
 - With rigid movements you prepare your body for the Embed the Cycle spell
@@ -138,6 +140,7 @@ prep_messages:
 - You clasp your silvery-white flame shrouded hands together prayerfully
 - Focusing intently, you slice seven straight lines through the air as you invoke
 - You exhale softly, your breath flowing into a shimmering cloud of iridescent air
+- Eschewing motions and sound, you painstakingly focus your mind solely on creating
 - You inhale sharply, invoking the
 - You focus your thoughts on the immolation of the skies.
 - You are now prepared to cast
@@ -317,6 +320,7 @@ khri_preps:
 - You begin to draw your focus
 - Reaching within, you prepare
 - You focus inward, attempting to increase your stamina and slow your heartbeat
+- You find your second self in the abyss of your mindspace
 
 barb_abilities:
   Python:
@@ -389,6 +393,11 @@ barb_abilities:
     start_command: form buffalo
     activated_message: Lurching forward, you reposition your burden and mimic
     expired_message: finish practicing the Form of the Buffalo
+  Heitak:
+    type: form
+    start_command: form heitak
+    activated_message: Every fiber cries out to leap, to stomp!
+    expired_message: finish practicing the Form of the Heitak
   Drought:
     type: berserk
     start_command: berserk drought
@@ -493,6 +502,11 @@ barb_abilities:
     start_command: meditate seek
     activated_message: ^You .* to meditate
     expired_message: enhanced understanding of the natural world vanishes
+  Axis:
+    type: meditation
+    start_command: meditate axis
+    activated_message: ^You .* to meditate
+    expired_message: The rhythm of the Axis in your core dissolves
 
 # Barbarian Roars and Bardic Screams
 # https://elanthipedia.play.net/Category:Roars
@@ -1253,9 +1267,9 @@ spell_data:
     harmless: true
     prep: prepare
     guild: Cleric
-  Major Physical Protection:
+  Starry Waters:
     skill: Augmentation
-    abbrev: MAPP
+    abbrev: STAW
     mana: 5
     recast: 1
     mana_type: holy
@@ -1285,9 +1299,9 @@ spell_data:
     mana_type: holy
     prep: prepare
     guild: Cleric
-  Minor Physical Protection:
+  Visage:
     skill: Warding
-    abbrev: MPP
+    abbrev: VISAGE
     mana: 1
     recast: 1
     mana_type: holy
@@ -3007,7 +3021,7 @@ spell_data:
     metamagic: true
   River in the Sky:
     skill: Warding
-    abbrev: rits
+    abbrev: RITS
     mana: 15
     guild: Ranger
     mana_type: life

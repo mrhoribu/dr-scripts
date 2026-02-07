@@ -8728,6 +8728,7 @@ crafting_recipes:
   herb1: dioica
   herb1_stock:
   liquid: alcohol
+  # Remedies Chapter 6 recipes
 - name: a body draught
   noun: draught
   volume: 1
@@ -8738,7 +8739,6 @@ crafting_recipes:
   herb1: ojhenik
   herb1_stock: 12
   liquid: alcohol
-# Remedies Chapter 6 recipes
 - name: a face draught
   noun: draught
   volume: 1
@@ -9100,7 +9100,7 @@ crafting_recipes:
   noun: bone totem
   type: artificing
   chapter: 2
-  work_order: true
+  work_order: false
   enchant_stock1_name: abolition
   enchant_stock1: 2
   enchant_stock2_name: metamorphosis

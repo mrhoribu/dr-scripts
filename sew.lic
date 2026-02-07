@@ -2,8 +2,6 @@
   Documentation: https://elanthipedia.play.net/Lich_script_repository#sew
 =end
 
-custom_require.call(%w[common common-arcana common-crafting common-items common-money common-travel events])
-
 class Sew
   def initialize
     @settings = get_settings
@@ -163,8 +161,8 @@ class Sew
 
   def lift_or_stow_feet
     if DRCI.lift?
-      DRCC.stow_crafting_item(DRC.right_hand, @bag, @belt) if DRC.right_hand
-      DRCC.stow_crafting_item(DRC.left_hand, @bag, @belt) if  DRC.left_hand
+      DRCC.stow_crafting_item(DRC.right_hand, @bag, @belt) if DRC.right_hand && !DRC.right_hand.include?(@noun.tr('.', ' '))
+      DRCC.stow_crafting_item(DRC.left_hand, @bag, @belt) if DRC.left_hand && !DRC.left_hand.include?(@noun.tr('.', ' '))
     else
       DRC.bput('stow feet', 'You put', 'Stow what')
     end
@@ -213,6 +211,7 @@ class Sew
                         'You must assemble',
                         'You need another',
                         'You untie and discard',
+                        /^The .* needles must be cast to finish binding the knit yarn\.$/,
                         /^Roundtime/,
                         /^You realize that cannot be repaired, and stop/)
       case result
@@ -284,7 +283,7 @@ class Sew
         command = 'turn my needles'
       when 'Next the needles must be pushed', 'ready to be pushed', 'Some purl stitching is'
         command = 'push my needles'
-      when 'The garment is nearly complete and now must be cast off'
+      when 'The garment is nearly complete and now must be cast off', /^The .* needles must be cast to finish binding the knit yarn\.$/
         command = 'cast my needles'
       when 'You are already knitting', 'Do you really want to discard'
         command = 'pull my needles'
@@ -313,7 +312,9 @@ class Sew
       DRCC.stow_crafting_item('stamp', @bag, @belt)
     end
 
-    DRCC.stow_crafting_item(DRC.right_hand, @bag, @belt)
+    DRCC.stow_crafting_item(DRC.right_hand, @bag, @belt) unless DRC.right_hand&.include?(@noun.tr('.', ' '))
+    DRCC.stow_crafting_item(DRC.left_hand, @bag, @belt) unless DRC.left_hand&.include?(@noun.tr('.', ' '))
+
     case @finish
     when /log/
       DRCC.logbook_item('outfitting', @noun, @bag)

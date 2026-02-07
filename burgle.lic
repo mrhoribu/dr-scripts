@@ -6,8 +6,6 @@ Documentation: https://elanthipedia.play.net/Lich_script_repository#burgle
 
 =end
 
-custom_require.call(%w[common common-travel common-items equipmanager])
-
 class Burgle
   def initialize
     arg_definitions = [
@@ -437,6 +435,7 @@ class Burgle
     return if Flags['burgle-footsteps']
 
     result = DRC.bput("search #{target}", 'It looks valuable', 'Roundtime', 'I could not')
+    waitrt?
     @search_count += 1
     if result =~ /It looks valuable/
       store_loot if DRC.right_hand && DRC.left_hand

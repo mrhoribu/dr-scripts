@@ -389,6 +389,7 @@ hunting_zones:
   - 665
   # https://elanthipedia.play.net/Giant_mechanical_mouse                  0-2000
   # Flex creatures, require special weapon material to hit
+  # 51715, 51716, and 132 are outdoors, rest are indoors.
   mechanical_mice:
   - 134
   - 13468
@@ -400,6 +401,8 @@ hunting_zones:
   - 6873
   - 132
   - 133
+  - 51716
+  - 51715
   # https://elanthipedia.play.net/Musk_Hog                                 10-35
   hogs:
   - 1438
@@ -431,10 +434,10 @@ hunting_zones:
   - 6088
   - 6090
   - 6089
+  - 6087
   elder_silverfish:
   # Beyond the jagged opening elder hardened silverfish (~14 relative level) spawn.
   # Premie Only
-  - 6087
   - 6086
   - 6085
   - 6084
@@ -525,6 +528,14 @@ hunting_zones:
   - 10053
   - 10052
   - 10051
+  # https://elanthipedia.play.net/Cougar                                   30-49
+  cougars_forest_of_night:
+  - 9352
+  - 9353
+  - 9354
+  - 9355
+  - 9356
+  - 9357
   # https://elanthipedia.play.net/Grass_eel                                25-50
   grass_eels:
   - 1492
@@ -634,6 +645,14 @@ hunting_zones:
   - 8475
   - 8476
   - 8477
+  # https://elanthipedia.play.net/Ichorous_ossein_amalgam			70-90
+  ossein_amalgams:
+  - 10041
+  - 10042
+  - 10043
+  - 10044
+  - 10045
+  - 10046
   # new mob - critter level 18-22                                          85-130
   greater_water_sprites:
   - 8465
@@ -768,9 +787,9 @@ hunting_zones:
   - 1585
   # https://elanthipedia.play.net/Rock_Troll_(1)                           60-73
   rock_trolls:
-  #- 8945 do not use due to players caught on CLIMB BARRICADE
-  #- 8955 do not use due to enviromental ROCK that will break STOW commands
-  - 8946
+  # - 8945 # do not use due to players caught on CLIMB BARRICADE
+  # - 8955 # do not use due to enviromental ROCK that will break STOW commands
+  # - 8946 # Nothing seems to spawn in this room
   - 8947
   - 8954
   - 8948
@@ -1256,6 +1275,13 @@ hunting_zones:
   - 13035
   - 11284
   - 11281
+  # https://elanthipedia.play.net/Shadewing_harpy                        700-900
+  shadewing_harpy:
+  - 51762
+  - 51763
+  - 51764
+  - 51765
+  - 51766
   # https://elanthipedia.play.net/Xala%27shar_magus                     750-1000
   # https://elanthipedia.play.net/Xala%27shar_thrall                    750-1000
   xalas_1:
@@ -1389,7 +1415,7 @@ hunting_zones:
 ##########                           ILITHI                           ##########
 ##########                                                            ##########
 ################################################################################
-  # https://elanthipedia.play.net/Kobold                                   35-50
+  # https://elanthipedia.play.net/Kobold                                  35-50
   shard_kobolds:
   - 2739
   - 2744
@@ -1397,6 +1423,15 @@ hunting_zones:
   - 2763
   - 2764
   - 2740
+  # https://elanthipedia.play.net/Lengthy_grass_eel                       45-60
+  lengthy_grass_eels:
+  - 51789
+  - 51790
+  - 51791
+  - 51792
+  - 51793
+  - 51794
+  - 51795
   # https://elanthipedia.play.net/Snippet                                 70-100
   # Construct
   snippets:
@@ -1633,6 +1668,15 @@ hunting_zones:
   - 9512
   - 9511
   - 9510
+  - 9509
+  - 9505
+  - 9504
+  - 9503
+  - 9502
+  - 9501
+  - 9500
+  - 9499
+  - 15352
   # https://elanthipedia.play.net/Red-bristled_gremlin                   280-410
   # premie only rooms
   red_gremlins:
@@ -1896,8 +1940,8 @@ hunting_zones:
   # Can pick you up and drop you, massive bleders, broken legs
   #  - Use wings to help assist in avoiding this
   bone_wyverns:
-  - 13121
   - 13120
+  - 13121
   - 13119
   - 13118
   - 13123
@@ -3516,7 +3560,6 @@ hunting_zones:
   # https://elanthipedia.play.net/Salt_crab                                25-42
   salt_crabs_fang:
   # - 8312 # rock in the room interferes with stowing rock ammo
-  - 8313
   - 8313
   - 8316
   - 8315

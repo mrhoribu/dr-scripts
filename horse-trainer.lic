@@ -2,8 +2,6 @@
   Documentation: https://elanthipedia.play.net/Lich_script_repository#horse-trainer
 =end
 
-custom_require.call(%w[common])
-
 class TeachHorse
   def initialize
     @teachable_skills = %w[leadrope saddle animal joust kneel prance beg spin jump combat magic war]
@@ -18,7 +16,7 @@ class TeachHorse
 
   def instruct(skill)
     @start = Time.now
-    case DRC.bput("instruct horse #{skill}", 'You begin', 'horse is already')
+    case DRC.bput("instruct horse #{skill}", 'You begin', 'horse is already', /^You don't know enough about that to instruct a horse/)
     when 'horse is already'
       return
     end
