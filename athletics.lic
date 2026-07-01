@@ -14,8 +14,6 @@ class Athletics
     have_climbing_rope = get_settings.have_climbing_rope
     @outdoorsmanship_rooms = get_settings.athletics_outdoorsmanship_rooms
 
-    DRC.wait_for_script_to_complete('buff', ['athletics'])
-
     get_athletics_items
 
     start_exp = DRSkill.getxp('Athletics')
@@ -28,13 +26,16 @@ class Athletics
         { name: 'xalas', regex: /^xala.*/i, optional: true, description: 'Climb xalas in zoluren in instead of undergondola' },
         { name: 'stationary', regex: /^stat.*/i, optional: true, description: 'Stand still and use a climbing rope' },
         { name: 'cliffs', regex: /^cliff.*/i, optional: true, description: 'Climb undergondola without attempting branch' },
-        { name: 'max', regex: /^max/i, optional: true, description: 'Keep training until 32/34+' }
+        { name: 'max', regex: /^max/i, optional: true, description: 'Keep training until 32/34+' },
+        { name: 'skip_magic', regex: /skip_magic/i, optional: true, description: 'Skip buffing and pass skip_magic to outdoorsmanship' }
       ]
     ]
 
     args = parse_args(arg_definitions)
 
+    @skip_magic = args.skip_magic
     @end_exp = 32 if args.max
+    DRC.wait_for_script_to_complete('buff', ['athletics']) unless @skip_magic
     if args.wyvern || (@settings.climbing_target == 'wyvern')
       climb_wyvern
     elsif args.undergondola || (@settings.climbing_target == 'undergondola')
@@ -52,7 +53,7 @@ class Athletics
     elsif athletics_location == 'Crossing'
       crossing_athletics
     elsif athletics_location == 'Riverhaven'
-      crossing_athletics if DRSkill.getrank('Athletics') > 140
+      riverhaven_athletics
     elsif athletics_location == 'Shard'
       shard_athletics
     elsif athletics_location == 'Hibarnhvidar'
@@ -65,10 +66,11 @@ class Athletics
   end
 
   def outdoorsmanship_waiting(number)
+    skip_magic = @skip_magic ? 'skip_magic' : ''
     start = Time.now
     DRCT.walk_to(@outdoorsmanship_rooms.sample) unless @outdoorsmanship_rooms.empty?
     stow_athletics_items
-    DRC.wait_for_script_to_complete('outdoorsmanship', [number, "room=#{Room.current.id}", 'rock'])
+    DRC.wait_for_script_to_complete('outdoorsmanship', [number, "room=#{Room.current.id}", 'rock', skip_magic])
     remaining_pause = ((number * 15) - (Time.now - start))
     pause remaining_pause if remaining_pause > 0
     get_athletics_items
@@ -127,7 +129,7 @@ class Athletics
     Flags.add('climbing-finished', 'You finish practicing your climbing', 'The rope\'s will quickly fades away', 'Your focus diverts away from the rope')
     Flags.add('climbing-too-hard', 'This climb is too difficult')
     Flags.add('climbing-too-easy', 'This climb is no challenge at all, so you stop practicing')
-    Flags.add('climbing-dead-rope', '^You believe you can use it for \d+ minutes per day\.', '^You finish practicing your climbing skill just as your rope begins to slacken')
+    Flags.add('climbing-dead-rope', '^You believe you can use it for \d+ minutes per day\.')
     Flags.add('climbing-live-rope', '^You believe you haven\'t yet used it today')
 
     DRCI.stow_hands
@@ -140,6 +142,7 @@ class Athletics
     until done_training? || Flags['climbing-dead-rope']
       DRC.fix_standing
       Flags.reset('climbing-finished')
+      DRC.stop_playing
       break unless DRC.play_song?(@settings, @song_list, true, true, true)
 
       case DRC.bput("climb practice #{@settings.climbing_rope_adjective} rope", 'You begin to practice ', 'you mime a convincing climb while pulling the rope hand over hand', 'Directing your attention toward your rope', 'Allows you to climb various things like a tree', 'But you aren\'t holding', 'You should stop practicing')
@@ -163,7 +166,7 @@ class Athletics
             DRC.stop_playing
             offset_climbing_song(1)
             break
-          elsif Flags['dead-rope']
+          elsif Flags['climbing-dead-rope']
             break unless check_rope?
             break unless DRC.play_song?(@settings, @song_list, true, true, true)
           end
@@ -228,6 +231,48 @@ class Athletics
       DRC.message("The xalas argument will train faster at 650+ athletics.  Be aware that it's potentially dangerous.") if DRSkill.getmodrank('Athletics') > 650
       override_location_and_practice('arthelun_rocks')
       DRC.message("The xalas argument will train faster at 650+ athletics.  Be aware that it's potentially dangerous.") if DRSkill.getmodrank('Athletics') > 650
+    end
+  end
+
+  def riverhaven_athletics
+    until done_training?
+      if DRSkill.getmodrank('Athletics') <= 300
+        DRCT.walk_to(12821)
+        move('climb stair')
+        move('climb stair')
+        DRCT.walk_to(13755)
+        DRCT.walk_to(14723)
+        DRCT.walk_to(451)
+        DRCT.walk_to(13805)
+        DRCT.walk_to(13810)
+        DRCT.walk_to(394)
+        move('climb ladder')
+        move('climb ladder')
+        if DRSkill.getmodrank('Athletics') >= 10
+          DRCT.walk_to(51158)
+          DRCT.walk_to(491)
+          move('climb tree')
+          move('climb trunk')
+          DRCT.walk_to(7839)
+        end
+        DRCT.walk_to(7842)
+        DRCT.walk_to(7822)
+        DRCT.walk_to(577)
+        DRCT.walk_to(602)
+        move('climb bank')
+        move('climb bank')
+        break if done_training?
+        DRCT.walk_to(306)
+        DRCT.walk_to(309)
+        break if done_training?
+
+        if DRSkill.getmodrank('Athletics') >= 140
+          DRCT.walk_to(11440)
+          DRCT.walk_to(7640)
+        end
+      else
+        crossing_athletics
+      end
     end
   end
 

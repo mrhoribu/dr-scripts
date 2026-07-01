@@ -1,0 +1,197 @@
+=begin
+original author: Crannach
+refactored by: EO/dr-scripts
+game: dr
+version: 1.0.0
+
+Summary -- Researches a single topic. Type ';researcher help' for usage and options.
+
+=end
+
+VALID_RESEARCH_TOPICS = %w[fundamental stream augmentation utility warding sorcery energy field spell plane planes road wild].freeze
+VALID_SYMBIOSIS_TYPES = %w[activate avoid cast discern endure examine explore harness harvest heal impress learn perform remember resolve spell spring strengthen watch].freeze
+
+class Researcher
+  def initialize
+    @settings = get_settings
+    args = get_args
+
+    unless DRSpells.known_spells.include?('Gauge Flow')
+      DRC.message("Gauge Flow is required to research. Exiting.")
+      exit
+    end
+
+    @debug = args.debug || @settings.dig('research', 'debug') || false
+    @current_topic = resolve_topic(args)
+    add_flags
+    UserVars.researcher ||= {}
+    validate_research_topic
+    check_status
+    check_research
+    loop do
+      pause 5
+      check_research
+      break unless researching
+    end
+  end
+
+  # Determines the research topic from CLI args or YAML settings.
+  #
+  # @param args [OpenStruct] parsed CLI arguments
+  # @return [String] the resolved research topic
+  def resolve_topic(args)
+    if args.skill
+      return args.skill
+    elsif args.symbiosis
+      unless args.sym_type
+        DRC.message("Symbiosis research requires a type.")
+        DRC.message("Usage: ;researcher symbiosis <type>")
+        DRC.message("Valid types: #{VALID_SYMBIOSIS_TYPES.join(', ')}")
+        exit
+      end
+      return "symbiosis #{args.sym_type}"
+    end
+
+    topic = @settings.dig('research', 'topic')
+    unless topic
+      DRC.message("No research topic specified.")
+      DRC.message("Either provide a topic as an argument or configure 'research: topic:' in your YAML settings.")
+      DRC.message("Type ';researcher help' for more information.")
+      exit
+    end
+    topic
+  end
+
+  # Validates and normalizes @current_topic against known topic lists.
+  #
+  # @return [void]
+  def validate_research_topic
+    @current_topic = @current_topic&.downcase
+    return if @current_topic&.match?(/^symbiosis \S+$/)
+
+    @current_topic = 'stream' if @current_topic == 'attunement'
+
+    unless @current_topic && VALID_RESEARCH_TOPICS.include?(@current_topic)
+      DRC.message("Invalid research topic: #{@current_topic}")
+      DRC.message("Valid topics are: #{VALID_RESEARCH_TOPICS.join(', ')}")
+      DRC.message("For symbiosis research, use: ;researcher symbiosis <type>")
+      DRC.message("Type ';researcher help' for more information.")
+      exit
+    end
+  end
+
+  # @param status [Boolean] whether research is active
+  # @return [void]
+  def set_researching(status)
+    echo "researching=#{status}" if @debug
+    UserVars.researcher['researching'] = status
+    UserVars.researcher['timestamp'] = Time.now
+  end
+
+  # @return [Boolean] true when actively researching with Gauge Flow up
+  def researching
+    return false if Flags['research-partial']
+    return false if Flags['research-complete']
+    return false unless DRSpells.active_spells.include?('Gauge Flow')
+    UserVars.researcher['researching']
+  end
+
+  # @return [void]
+  def add_flags
+    Flags.add('research-partial', 'there is still more to learn before', 'distracted by combat', 'distracted by your spellcasting', 'You lose your focus on your research project', 'you forget what you were') unless Flags['research-partial']
+    Flags.add('research-complete', '^Breakthrough!', 'You complete reviewing your knowledge of the \w+ symbiosis and commit the details to memory') unless Flags['research-complete']
+  end
+
+  # Queries game for research state and cancels any mismatched project.
+  # Uses a topic keyword as the first bput pattern so it matches before
+  # the generic patterns when the right topic is active.
+  #
+  # @return [void]
+  def check_status
+    keyword = @current_topic.sub(/^symbiosis /, '')
+    result = DRC.bput('research status',
+                      "#{keyword}.*You estimate",
+                      "#{keyword}.*completed \\d+%",
+                      'You estimate that you will complete it a few minutes from now',
+                      "You have completed \\d+% of a project about",
+                      "You're not researching anything")
+    if result =~ /You estimate|completed/ && result !~ /#{Regexp.escape(keyword)}/i
+      cancel_research
+    end
+    set_researching(false)
+  end
+
+  # Cancels any active research. Sends three cancels to handle the worst
+  # case of active session + project: stop session, request cancel, confirm.
+  # Extra cancels when already cancelled are harmless ("not researching").
+  #
+  # @return [void]
+  def cancel_research
+    fput('research cancel')
+    fput('research cancel')
+    fput('research cancel')
+  end
+
+  # @return [void]
+  def check_research
+    if Flags['research-partial']
+      Flags.reset('research-partial')
+      set_researching(false)
+      start_research
+    elsif Flags['research-complete']
+      Flags.reset('research-complete')
+      set_researching(false)
+      @current_topic = nil
+    else
+      start_research
+    end
+  end
+
+  # @return [void]
+  def start_research
+    return if researching
+
+    check_gaf
+    case DRC.bput("research #{@current_topic} 300", 'You expertly coach', 'You focus', 'You tentatively', 'You confidently', 'Abandoning the normal', 'You cannot begin', 'You are already busy', 'Usage:', "You do not know how to research", 'You start to research', 'You begin to bend', 'With a mixture of rational concern')
+    when 'You cannot begin'
+      cancel_research
+      start_research
+    when 'You focus', 'You tentatively', 'You confidently', 'Abandoning the normal', 'You are already busy', 'You start to research', 'You expertly coach', 'You begin to bend', 'With a mixture of rational concern'
+      set_researching(true)
+    when 'Usage:', 'You do not know how to research'
+      echo "Invalid research option"
+      set_researching(false)
+      exit
+    end
+  end
+
+  # @return [void]
+  def check_gaf
+    return if DRSpells.active_spells.include?('Gauge Flow')
+
+    gaf_spell_data = @settings.dig('waggle_sets', 'gaf', 'Gauge Flow')
+    if gaf_spell_data
+      echo "Using waggle set settings" if @debug
+      echo "waggle data: #{gaf_spell_data}" if @debug
+      DRCA.cast_spell(gaf_spell_data, @settings)
+    else
+      echo "Using min prep. Make a waggle_set called 'gaf' with Gauge Flow in it if you want more control" if @debug
+      DRCA.cast_spell({ 'abbrev' => 'gaf', 'mana' => 5 }, @settings)
+    end
+  end
+
+  # @return [OpenStruct] parsed CLI arguments
+  def get_args
+    arg_definitions = [
+      [
+        { name: 'skill', options: VALID_RESEARCH_TOPICS + %w[attunement], optional: true, description: 'Research topic to study' },
+        { name: 'symbiosis', regex: /^symbiosis$/i, optional: true, description: 'Do symbiosis research' },
+        { name: 'sym_type', options: VALID_SYMBIOSIS_TYPES, optional: true, description: 'Which symbiosis to research' },
+        { name: 'debug', regex: /^debug$/i, optional: true, description: 'Enable debug output' }
+      ]
+    ]
+    parse_args(arg_definitions)
+  end
+end
+
+Researcher.new

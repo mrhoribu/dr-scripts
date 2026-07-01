@@ -58,6 +58,7 @@ class Sew
     @info = get_data('crafting')['tailoring'][@hometown]
     @instructions = args.instructions
     @cloth = %w[silk wool burlap cotton felt linen electroweave steelsilk arzumodine bourde dergatine dragonar faeweave farandine imperial jaspe khaddar ruazin titanese zenganne]
+    @pin_pokes = 0
 
     DRC.wait_for_script_to_complete('buff', ['sew'])
 
@@ -228,10 +229,16 @@ class Sew
                         /You need a larger amount of material to continue crafting/,
                         /^Roundtime/,
                         /^You need a free hand to do that/,
-                        /^You realize that cannot be repaired, and stop/)
+                        /^You realize that cannot be repaired, and stop/,
+                        /^You must be holding the .* to do that/,
+                        /^You cannot do that while engaged!/)
       case result
       when /You need a larger amount of material to continue crafting/
-        Lich::Messaging.msg('bold', "Not enough material to continue crafting #{@noun}. Exiting.")
+        Lich::Messaging.msg('bold', "sew: Not enough material to continue crafting #{@noun}. Exiting.")
+        magic_cleanup
+        exit
+      when /^You must be holding the .* to do that/
+        Lich::Messaging.msg('bold', "sew: Required tool not in hand. Cannot continue crafting #{@noun}.")
         magic_cleanup
         exit
       when 'dimensions appear to have shifted and could benefit from some remeasuring', 'dimensions changed while working on it'
@@ -243,6 +250,7 @@ class Sew
         swap_tool('scissors')
         command = "cut my #{@noun} with my scissors"
       when 'and could use some pins to', 'is in need of pinning to help arrange the material for further sewing'
+        @pin_pokes += 1
         swap_tool('pins', true)
         command = "poke my #{@noun} with my pins"
       when 'deep crease develops along', 'wrinkles from all the handling and could use', 'Deep creases and wrinkles in the fabric'
@@ -314,6 +322,9 @@ class Sew
         finish if Flags['sew-done']
         swap_tool(@home_tool) unless @home_tool.nil?
         command = @home_command.nil? ? command : @home_command
+      when /^You cannot do that while engaged!/
+        DRC.retreat
+        pause 10
       end
     end
   end
@@ -323,6 +334,12 @@ class Sew
 
     DRCC.stow_crafting_item(DRC.right_hand, @bag, @belt)
     DRCC.get_crafting_item(next_tool, @bag, @bag_items, @belt, skip)
+
+    return if DRCI.in_hands?(next_tool)
+
+    Lich::Messaging.msg('bold', "sew: Failed to get '#{next_tool}'. Cannot continue crafting.")
+    magic_cleanup
+    exit
   end
 
   def finish
@@ -345,13 +362,13 @@ class Sew
     when /trash/
       DRCI.dispose_trash(@noun, @worn_trashcan, @worn_trashcan_verb)
     when /hold/
-      Lich::Messaging.msg('bold', "#{@noun} complete — holding in hand.")
+      Lich::Messaging.msg('bold', "#{@noun} complete -- holding in hand.")
     end
 
     lift_or_stow_feet
     magic_cleanup
 
-    Lich::Messaging.msg('plain', "Sew script finished (#{@noun}, finish: #{@finish}).")
+    Lich::Messaging.msg('plain', "sew: Completed #{@recipe_name} (chapter #{@chapter}, #{@noun}) - #{@pin_pokes} pin pokes, finish: #{@finish}")
     exit
   end
 
@@ -376,7 +393,7 @@ class Sew
     minutes_remaining = ((expire_time - Time.now) / 60).to_i
 
     if minutes_remaining < 10
-      Lich::Messaging.msg('bold', "*** RENTAL LOW (#{minutes_remaining} min) — AUTO-RENEWING ***")
+      Lich::Messaging.msg('bold', "*** RENTAL LOW (#{minutes_remaining} min) -- AUTO-RENEWING ***")
       renew_rental
     elsif minutes_remaining < 20
       Lich::Messaging.msg('bold', "*** Rental has #{minutes_remaining} minutes remaining ***")
@@ -386,7 +403,7 @@ class Sew
   end
 
   def renew_rental
-    Lich::Messaging.msg('bold', '*** RENTAL EXPIRING — AUTO-RENEWING ***')
+    Lich::Messaging.msg('bold', '*** RENTAL EXPIRING -- AUTO-RENEWING ***')
     Flags.reset('sew-rental-warning')
     case DRC.bput('mark notice',
                   'You mark the notice',
@@ -397,7 +414,7 @@ class Sew
     when "You don't have enough"
       Lich::Messaging.msg('bold', '*** INSUFFICIENT FUNDS TO RENEW RENTAL ***')
     when 'I could not find'
-      Lich::Messaging.msg('bold', '*** COULD NOT FIND NOTICE — CHECK LOCATION ***')
+      Lich::Messaging.msg('bold', '*** COULD NOT FIND NOTICE -- CHECK LOCATION ***')
     else
       Lich::Messaging.msg('bold', '*** RENTAL RENEWED ***')
     end

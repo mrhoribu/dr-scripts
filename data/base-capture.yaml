@@ -22,10 +22,17 @@ hollow_eve:
   
 taffelberry_faire:
   return_room: 16831
-  return_surface: cart
+  return_surface: envelope
   room_list: [16831, 16823, 16824, 16825, 16826, 16827, 16828, 16829, 16830]
   critter_names:
-    - !ruby/regexp /^(?!.*ragged\s)[\w\s]*scarecrow/ # Room 16823 contains a "ragged scarecrow" that is not part of the capture game, so no ragged scarecrows allowed.
+    - !ruby/regexp /(?<!ragged\s)scarecrow\b/ # Room 16823 contains a "ragged scarecrow" that is not part of the capture game, so no ragged scarecrows allowed.
     - ram
     - crow
     - tankard
+
+premium_festival:
+  return_room: 15908
+  return_surface: ocean-blue cart
+  room_list: [15891, 15890, 15897, 15899, 15902, 15910, 15908, 15906, 15913, 15914, 15926]
+  critter_names:
+    - seagull
