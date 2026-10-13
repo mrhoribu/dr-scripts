@@ -10,7 +10,7 @@ class Shape
     @worn_trashcan_verb = @settings.worn_trashcan_verb
     @bag = @settings.crafting_container
     @bag_items = @settings.crafting_items_in_container
-    @belt = @settings.engineering_belt
+    @belt = @settings.shaping_belt || @settings.engineering_belt # shaping_belt, falls back to engineering_belt (#1420)
     @stamp = @settings.mark_crafted_goods
 
     arg_definitions = [
@@ -90,6 +90,7 @@ class Shape
       if /again/ =~ DRC.bput('study my instructions', 'Roundtime', 'Study them again')
         DRC.bput('study my instructions', 'Roundtime', 'Study them again')
       end
+      DRCC.stow_crafting_item("#{@noun} instructions", @bag, @belt)
       swap_tool('drawknife')
       DRCC.get_crafting_item("#{@material} lumber", @bag, @bag_items, @belt)
       check_hand('lumber') unless DRCI.in_left_hand?('lumber')

@@ -639,12 +639,14 @@ module Harness
 
   class XMLData
     @@_room_title = nil
+    @@_room_exits = []
     @@_game = nil
     @@_server_time = nil
     @@_name = nil
 
     def self._reset
       @@_room_title = nil
+      @@_room_exits = []
       @@_game = nil
       @@_server_time = nil
       @@_name = nil
@@ -656,6 +658,14 @@ module Harness
 
     def self.room_title=(val)
       @@_room_title = val
+    end
+
+    def self.room_exits
+      @@_room_exits
+    end
+
+    def self.room_exits=(val)
+      @@_room_exits = val
     end
 
     # DR game instance code (e.g. 'DR' Prime, 'DRX' Platinum, 'DRF' Fallen,
@@ -825,6 +835,7 @@ module Harness
     Map._reset
     XMLData._reset
     UserVars._reset
+    Lich::DragonRealms::Creature._reset
   end
 
   def echo(message)
@@ -971,6 +982,24 @@ module Harness
   def right_hand
     $right_hand
   end
+
+  def checkleft(*hand)
+    return nil if $left_hand.nil?
+
+    hand.flatten!
+    hand.empty? ? $left_hand : hand.find { |instance| $left_hand =~ /#{instance}/i }
+  end
+
+  def checkright(*hand)
+    return nil if $right_hand.nil?
+
+    hand.flatten!
+    hand.empty? ? $right_hand : hand.find { |instance| $right_hand =~ /#{instance}/i }
+  end
+
+  # lich-5 global_defs.rb aliases these to checkleft/checkright.
+  alias lefthand checkleft
+  alias righthand checkright
 
   def waitrt?; end
 
@@ -1122,9 +1151,16 @@ module Harness
   # spec/spec_helper.rb for the full rationale.
   # ---------------------------------------------------------------------------
 
-  # Derive the trailing noun of an item long-name (mirrors DRC.get_noun).
+  # Item long-name decoration/attachment flavor text, copied verbatim from
+  # dragonrealms/commons/common.rb so _noun mirrors the real DRC.get_noun.
+  FLAVOR_TEXT_PATTERN = /\s?\b(?:(?:colorfully and )?(?:artfully|artistically|attractively|beautifully|bl?ack-|cleverly|clumsily|crudely|deeply|delicately|edged|elaborately|faintly|flamboyantly|front-|fully|gracefully|heavily|held|intricately|lavishly|masterfully|plentifully|prominantly|roughly|securely|sewn|shabbily|shadow-|simply|somberly|skillfully|sloppily|starkly|stitched|tied and|tightly|well-)\s?)?(?:accented|accentuated|acid-etched|adorned|affixed|appliqued|assembled|attached|augmented|awash|backed|back-laced|balanced|banded|batiked|beaded|bearded|bearing|bedazzled|bedecked|bejeweled|beset|bestrewn|blazoned|bordered|bound|braided|branded|brocaded|bristling|brushed|buckled|burned|buttoned|caked|camouflaged|capped|carved|caught|centered|chased|chiseled|cinched|circled|clasped|cloaked|closed|coated|cobbled together|coiled|colored|composed|concealed|connected|constructed|countoured|covered|crafted|crested|crisscrossed|crowded|crowned|cuffed|cut|dangling|dappled|decked|decorated|deformed|depicting|designed|detailed|discolored|displaying|divided|done|dotted|draped|drawn|dressed|drizzled|dusted|edged|elaborately|embedded|embell?ished|emblazed|emblazoned|embossed|embroidered(?: all over| painstakingly)?|enameled(?: across)?|encircled|encrusted|engraved|engulfed|enhanced|entwined|equipped|etched|fashioned(?: so)?|fastened|feathered|featuring|festooned|fettered|filed|filled|firestained|fit|fitted|fixed|flecked|fletched|forged|formed|framed|fringed|frosted|full|gathered|gleaming|glimmering|glittering|goldworked|growing|gypsy-set|hafted|hand-tooled|hanging|heavily(?:-beaded| covered)?|held fast|hemmed|hewn|hideously|highlighted|hilted|honed|hung|impressed|incised|ingeniously repurposed|inscribed|inlaid|inset|interlaced|interspersed|interwoven|jeweled|joined|laced(?: up)?|lacquered|laden|layered|limned|lined|linked|looped|knotted|made|marbled|marked|marred|meshed|mosaicked|mottled|mounted|oiled|oozing|outlined|ornamented|overlai(?:d|n)|padded|painted|paired|patched|pattern-welded|patterned|pinned|plumed|polished|printed|reinforced|reminiscent|rendered|revealing|riddled|ridged|rimed|ringed|riveted|sashed|scarred|scattered|scorched|sculpted|sealed|seamed|secured|securely|set|sewn|shaped|shimmering|shod|shot|shrouded|side-laced|slashed|slung|smeared|smudged|spangled|speckled|spiraled|splatter-dyed|splattered|spotted|sprinkled|stacked|surmounted|surrounded|suspended|stained|stamped|starred|stenciled|stippled|stitched(?: together)?|strapped|streaked|strengthened|strewn|striated|striped|strung|studded|swathed|swirled|tailored|tangled|tapered|tethered|textured|threaded|tied|tightly|tinged|tinted|tipped|tooled|topped|traced|trimmed|twined|veined|vivified|washed|webbed|weighted|whorled|worked|worn|woven|wrapped|wreathed|wrought)?\b ["]?\b(?:a hand-tooled|across|along|an|around|atop|bearing|belted|bright streaks|dangling|designed|detailing|down (?:each leg|one side)|dyed (?:a|and|deep|of|in|night|rust|shimmering|the|to|with)|engravings|entitled|errant pieces|featuring|flaunting|frescoed|from|Gnomish Pride|(?:encased |quartered )?in(?: the)?|into|labeled|leading|like|lining|matching|(?<!stick|slice|chunk|flask|hunk|series|set|pair|piece) of|on|out|overlayed gleaming silver|resembling|shades of color|sporting|surrounding|that|the|through|tinged somber black|titled|to|upon|WAR MONGER|with|within|\b(?:at|bearing|(?:accented |held |secured )?by|carrying|clutching|colored|cradling|dangling|depicting|(?:prominently )?displaying|embossed|etched|featuring|for(?:ming)?|holding|(?<!slice |chunk |flask |hunk |series |set |pair |piece )of|over|patterned|striped|suspending|textured|that)\b \b(?:a (?:band|beaded|brass|cascade|cluster|coral|crown|dead|.+ (?:ingot|boulder|stone|rock|nugget)|fierce|fanged|fringe|glowing|golden|grinning|howling|large|lotus|mosaic|pair|poorly|rainbow|roaring|row|silver(?:y|weave)?|small|snarling|spray|tailored|thick|tiny|trio|turquoise|yellowed)|(?:squared )?agonite (?:links|decorated)|alternating|an|(?:purple |blue )?and|ash|beaded fringe|blackened (?:steel(?: accents| bearing| with|$)|ironwood)|blue (?:gold|steel)|burnished golden|cascading layers|carved ivory|chain-lined|chitinous|(?:deep red|dull black|pale blue) cloth|cloudberry blossoms|colorful tightly|cotton candy|crimson steel|crisscrossed|curious design|curved|crystaline charm|dark (?:blue|green|grey|metals|windsteel) (?:and|exuding|glaes|hues|khor'vela|muracite|pennon|with)|dark supple|deepest|deeply blending|delicate|dusky (?:dreamweave|green-grey)|ebonwood$|emblazoned|enamel?led (?:steel|bronze)|etched|fine(?:-grained| black| crushed)|finely wrought|flame-kissed|forest|fused-together|fuzzy grey|gauze atop|gilded steel|glass eyeballs|glistening green|golden oak|grey fur|hammered|haralun|has|heavy (?:grey|pearl|silver)|horn|Ilithi cedar|inky black|interlocking silver|interwoven|iridescent|jagged interlocking plates|(?:soft dark|supple|thick|woven) (?:bolts|leather)|lightweight|long swaths|lustrous|kertig ravens|made|metal cogs|mirror-finished|mottled|multiple woods|naphtha|oak|oblong sanguine|one|onyx buttons|opposing images|overlapping|pale cerulean|pallid links|pastel-hued|pins|pitted (?:black iron|steel)|plush velvet|polished (?:bronze|hemlock|steel)|raccoon tails|ram's horns|rat pelts|raw|red and blue|rich (?:purple|golden)|riveted bindings|roughened|rowan|sanguine thornweave|scattered star|scorch marks|sculpted|shadows|shark cartilage|shifting (?:celadon|shades)|shipboard|(?:braided |cobalt |deep black |desert-tan |dusky red Taisidon |ebony |exquisite spider|fine leaf-green |flowing night|glimmering ebony |heavy |marigold |pale gold marquisette and virid |rich copper |spiral-braided |steel|unadorned black Musparan )?silk(?:cress)?|(?:coiled |shimmering )?silver(?:steel| and |y)?|sirese blue spun glitter|six crossed|slender|small bones|smoothly interlocking|snow leopard|soft brushed|somber black|sprawled|sun-bleached|steel links|stones|strips of|sunny yellow|teardrop plates|telothian|the|tiny (?:golden|indurium|scales|skull)|tightly braided|tomiek|torn|twists|two|undyed|vibrant multicolored|viscous|waves of|weighted|well-cured|white ironwood|windstorm gossamer|wintry faeweave|woven diamondwood))\b.*/.freeze
+
+  # Derive the trailing noun of an item long-name (mirrors DRC.get_noun):
+  # strip decoration/attachment flavor text first, so decorated items like
+  # "a circle of colorful wool with a wool rug on it" resolve to "wool"
+  # rather than the trailing "it".
   def self._noun(long_name)
-    long_name.to_s.strip.scan(/[a-z\-']+$/i).first
+    long_name.to_s.sub(FLAVOR_TEXT_PATTERN, "").strip.scan(/[a-z\-']+$/i).first
   end
 
   module DRC
@@ -1135,20 +1171,37 @@ module Harness
       def left_hand_noun; Harness._noun($left_hand); end
       def right_hand_noun; Harness._noun($right_hand); end
       def get_noun(long_name); Harness._noun(long_name); end
+      # Simplified: the real DRC.remove_flavor_text (lich-5 common.rb) also applies
+      # CustomSubstitutions patterns and does not strip. Don't write specs that depend
+      # on either difference.
+      def remove_flavor_text(item); item.to_s.sub(FLAVOR_TEXT_PATTERN, '').strip; end
+
+      # Mirrors the real DRC.list_to_array: split a game item sentence on the
+      # comma/and separators, keeping the article that begins each item (so
+      # non-first items retain their leading space, exactly like production).
+      def list_to_array(list)
+        list.strip.split(%r{(?:,|(?:, |\s)?and\s?)(?:\s?<pushBold/>\s?)?(?=\s\ba\b|\s\ban\b|\s\bsome\b|\s\bthe\b)}i).reject(&:empty?)
+      end
+
       def get_gems(*_args); []; end
       def get_town_name(name); name; end
       def text2num(text); text; end
       def message(*_args); end
       def wait_for_script_to_complete(*_args); end
       def fix_standing; end
+      def play_song?(*_args); true; end
+      def stop_playing; end
       def release_invisibility; end
       def beep; end
       def hide?(*_args); false; end
+      def can_see_sky?(*_args); false; end
       def forage?(*_args); false; end
       def collect(*_args); end
       def retreat(*_args); end
       def rummage(*_args); end
       def log_window(*_args); end
+      def safe_pause_list(*_args); []; end
+      def safe_unpause_list(*_args); end
     end
   end
 
@@ -1238,14 +1291,17 @@ module Harness
       /You work carefully at tending/,
       /You work carefully at binding/,
       /That area has already been tended to/,
-      /That area is not bleeding/
+      /That area is not bleeding/,
+      /slips free/
     ].freeze
 
     TEND_FAILURE_PATTERNS = [
       /You fumble/,
       /too injured for you to do that/,
       /TEND allows for the tending of wounds/,
-      /^You must have a hand free/
+      /^You must have a hand free/,
+      /^You carelessly attempt/,
+      /^You foolishly attempt/
     ].freeze
 
     TEND_DISLODGE_PATTERNS = [
@@ -1310,6 +1366,7 @@ module Harness
       def moon_used_to_summon_weapon(*_args); end
       def get_telescope?(*_args); true; end
       def store_telescope?(*_args); true; end
+      def get_div_tool?(*_args); true; end
       def store_div_tool?(*_args); true; end
       def observe(*_args); end
       def predict(*_args); end
@@ -1319,6 +1376,7 @@ module Harness
       def use_div_tool(*_args); end
       def center_telescope(*_args); end
       def peer_telescope(*_args); []; end
+      def update_astral_data(data, *_args); data; end
     end
   end
 
@@ -1339,6 +1397,57 @@ module Harness
 
     module Util
       def self.issue_command(*_args); []; end
+    end
+
+    module DragonRealms
+      # Stand-in for lich-5's creature registry (lib/dragonrealms/creature.rb).
+      # Real CreatureInstance objects expose id/noun/name plus status flags; a
+      # spec only needs to seed the room roster, so any object answering the
+      # attributes the script under test reads (an OpenStruct is plenty) works.
+      #
+      # in_room/targets ignore their status filters (:dead, :not_dead, :hostile,
+      # ...) and return whatever was seeded -- seed the roster you want the
+      # filtered call to produce. The filters are still recorded (in
+      # _in_room_filters / _targets_filters) so a spec can assert the script
+      # asked for the right ones. [] resolves a seeded creature by its id.
+      module Creature
+        @@_room = []
+        @@_in_room_filters = []
+        @@_targets_filters = []
+
+        def self._reset
+          @@_room = []
+          @@_in_room_filters = []
+          @@_targets_filters = []
+        end
+
+        # Seed the roster with an array of creature-like objects.
+        def self._set_room(creatures)
+          @@_room = creatures
+        end
+
+        def self._in_room_filters
+          @@_in_room_filters
+        end
+
+        def self._targets_filters
+          @@_targets_filters
+        end
+
+        def self.in_room(*filters)
+          @@_in_room_filters << filters
+          @@_room
+        end
+
+        def self.targets(*filters)
+          @@_targets_filters << filters
+          @@_room
+        end
+
+        def self.[](id)
+          @@_room.find { |creature| creature.id == id }
+        end
+      end
     end
   end
 end

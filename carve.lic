@@ -7,7 +7,7 @@ class Carve
     @settings = get_settings
     @bag = @settings.crafting_container
     @bag_items = @settings.crafting_items_in_container
-    @belt = @settings.engineering_belt
+    @belt = @settings.carving_belt || @settings.engineering_belt # carving_belt, falls back to engineering_belt (#1420)
     @stamp = @settings.mark_crafted_goods
 
     arg_definitions = [
@@ -35,9 +35,9 @@ class Carve
     @training_spells = @settings.crafting_training_spells
 
     @main_tool = if @type == 'stack' || @type == 'bone'
-                   @settings.carving_tools.find { |item| /\bsaw/i =~ item }
+                   (@settings.engineering_tools || @settings.carving_tools).find { |item| /\bsaw/i =~ item }
                  else
-                   @settings.carving_tools.find { |item| /\bchisel/i =~ item }
+                   (@settings.engineering_tools || @settings.carving_tools).find { |item| /\bchisel/i =~ item }
                  end
 
     DRC.wait_for_script_to_complete('buff', ['carve'])

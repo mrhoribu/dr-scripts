@@ -36,6 +36,9 @@ Crossing:
   gemshop:
     id: 4652
     name: appraiser
+  premium_gemshop:
+    id: 12223
+    name: Jasmine
   pawnshop:
     id: 8261
     name: Cormyn
@@ -1016,6 +1019,8 @@ Ratha:
   tannery:
     id: 10753
     name: Lysskava'an
+  locksmithing:
+    id: 51654
   npc_empath:
     id: 10741
   debt_office:
@@ -1400,6 +1405,17 @@ Raven's Point:
     id: 14642
   trader_outpost:
     id: 4440
+  deposit:
+    id: 9425
+  exchange:
+    id: 9426
+    fee: 0.05
+  gemshop:
+    id: 9430
+    name: Gimsta
+  tannery:
+    id: 9431
+    name: Stedh
 Boar Clan:
   currency: dokoras
   vault:
@@ -1489,6 +1505,7 @@ Fang Cove:
     name:
       - Wickett
       - attendant
+      - gemsmith
   tannery:
     id: 8394
     name: Gorund
@@ -1590,6 +1607,9 @@ Hara'jaal:
   gemshop:
     id: 15293
     name: Abira
+  pawnshop:
+    id: 15278
+    name: Dumi
   tannery:
     id: 15307
     name: assistant

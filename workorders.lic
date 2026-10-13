@@ -5,7 +5,7 @@
 =end
 
 class WorkOrders
-  VERSION = '1.0.0'.freeze
+  VERSION = '1.0.2'.freeze
 
   # Pattern constants for game responses
   GIVE_LOGBOOK_SUCCESS_PATTERNS = [
@@ -22,12 +22,29 @@ class WorkOrders
     "What is it you're trying to give"
   ].freeze
 
+  GIVE_LOGBOOK_INCOMPLETE_PATTERN = "The work order isn't yet complete".freeze
+
   NPC_NOT_FOUND_PATTERN = "What is it you're trying to give".freeze
+
+  # The clerk's repair quote, e.g. "That will cost 4,447 Kronars to repair.
+  # Just give it to me again..." -- captured (cost included) so we can read the
+  # price and top up from the bank if we are short before confirming. This only
+  # matches when the cost and prompt share one game line (the observed format);
+  # the bare 'Just give it to me again' below is kept as a fallback so a split
+  # line still matches the prompt (repair proceeds, just without auto-funding).
+  REPAIR_QUOTE_PATTERN = /cost [\d,]+ \w+ to repair.*give it to me again/i
+
+  # Clerk's response when we lack the coin to pay for a repair.
+  REPAIR_NEED_COIN_PATTERN = 'more coin'
+
+  # Extra forge attempts beyond asked quantity to cover quality rejects / failed crafts
+  FORGE_ATTEMPT_BUFFER = 5
 
   REPAIR_GIVE_PATTERNS = [
     "I don't repair those here",
     'What is it',
     "There isn't a scratch on that",
+    REPAIR_QUOTE_PATTERN,
     'Just give it to me again',
     'I will not',
     "I can't fix those.  They only have so many uses and then you must buy another."
@@ -61,7 +78,18 @@ class WorkOrders
     'You must bundle and deliver \d+ more'
   ].freeze
 
+  # Full item capture must be used in bput - a shorter prefix match returns only the
+  # matched substring and drops the item name (item + remaining are often one line).
+  LOGBOOK_ITEM_PATTERN = /This logbook is tracking a work order requiring you to craft (?<item>.+?) from any/i.freeze
   LOGBOOK_REMAINING_PATTERN = /You must bundle and deliver (?<remaining>\d+) more/.freeze
+
+  RESUME_LOGBOOK_PATTERNS = [
+    LOGBOOK_ITEM_PATTERN,
+    'This work order appears to be complete.',
+    'is not currently tracking',
+    'has expired',
+    LOGBOOK_REMAINING_PATTERN
+  ].freeze
 
   COUNT_PATTERN = /(?<count>\d+)/.freeze
   POLISH_COUNT_PATTERN = /The surface polish has (?<count>\d+) uses remaining/.freeze
@@ -76,17 +104,18 @@ class WorkOrders
   def initialize
     arg_definitions = [
       [
-        { name: 'discipline', options: %w[blacksmithing weaponsmithing tailoring shaping carving remedies artificing], description: 'What type of workorder to do?' },
+        { name: 'discipline', options: %w[blacksmithing weaponsmithing tailoring shaping carving remedies artificing tinkering], description: 'What type of workorder to do?' },
         { name: 'repair', regex: /repair/i, optional: true, description: 'repair tools instead of crafting' },
-        { name: 'turnin', regex: /turnin/i, optional: true, description: 'get work order and turn it in immediately with items already on hand' }
+        { name: 'turnin', regex: /turnin/i, optional: true, description: 'get work order and turn it in immediately with items already on hand' },
+        { name: 'continue', regex: /continue/i, optional: true, description: 'resume an in-progress workorder from the logbook' }
       ]
     ]
 
     args = parse_args(arg_definitions)
-    work_order(args.discipline, args.repair, args.turnin)
+    work_order(args.discipline, args.repair, args.turnin, args.continue)
   end
 
-  def work_order(discipline, repair, turnin)
+  def work_order(discipline, repair, turnin, continue_order = nil)
     @settings = get_settings
     @worn_trashcan = @settings.worn_trashcan
     @worn_trashcan_verb = @settings.worn_trashcan_verb
@@ -117,6 +146,8 @@ class WorkOrders
 
     info = crafting_data[discipline][@hometown]
     info = crafting_data['blacksmithing'][@hometown] if discipline == 'weaponsmithing'
+    # Tinkering uses the Engineering guild (shaping) NPC and logbook
+    info = crafting_data['shaping'][@hometown] if discipline == 'tinkering'
 
     recipes = if @recipe_overrides[discipline]
                 get_data('recipes').crafting_recipes.select { |recipe| recipe['type'] =~ /#{discipline}/i && @recipe_overrides[discipline].find { |name| recipe['name'] =~ /#{name}/i } }
@@ -131,7 +162,12 @@ class WorkOrders
       exit
     end
 
-    unless repair
+    item = nil
+    quantity = nil
+    if continue_order
+      item_name, quantity = resume_work_order(info['logbook'], recipes)
+      item = recipes.find { |r| r['name'] == item_name } if item_name
+    elsif !repair
       if @settings.workorder_diff.is_a?(Hash)
         item_name, quantity = request_work_order(recipes, info['npc-rooms'], info['npc'], info['npc_last_name'], discipline, info['logbook'], @settings.workorder_diff[discipline])
       else
@@ -159,23 +195,25 @@ class WorkOrders
       @outfitting_room = @settings.outfitting_room
       tools = @settings.outfitting_tools
       @belt = @settings.outfitting_belt
-      case item['chapter']
-      when 4, 2, 3
-        craft_method = :sew_items
-      when 5
-        materials_info = crafting_data['stock'][@workorders_materials['knit_type']]
-        craft_method = :knit_items
-      else
-        if item['chapter']
-          Lich::Messaging.msg('bold', "WorkOrders: Unknown chapter for tailoring item: #{item}")
-          exit
+      if item
+        case item['chapter']
+        when 4, 2, 3
+          craft_method = :sew_items
+        when 5
+          materials_info = crafting_data['stock'][@workorders_materials['knit_type']]
+          craft_method = :knit_items
+        else
+          if item['chapter']
+            Lich::Messaging.msg('bold', "WorkOrders: Unknown chapter for tailoring item: #{item}")
+            exit
+          end
         end
       end
     when 'shaping'
       materials_info = crafting_data['stock'][@workorders_materials['wood_type']]
       skill = 'Engineering'
       @engineering_room = @settings.engineering_room
-      tools = @settings.shaping_tools
+      tools = @settings.shaping_tools || @settings.engineering_tools
       @belt = @settings.engineering_belt
       craft_method = :shape_items
     when 'carving'
@@ -186,7 +224,7 @@ class WorkOrders
                        end
       skill = 'Engineering'
       @engineering_room = @settings.engineering_room
-      tools = @settings.carving_tools
+      tools = @settings.carving_tools || @settings.engineering_tools
       @belt = @settings.engineering_belt
       craft_method = :carve_items
     when 'remedies'
@@ -201,6 +239,13 @@ class WorkOrders
       tools = @settings.enchanting_tools
       @belt = @settings.enchanting_belt
       craft_method = :enchanting_items
+    when 'tinkering'
+      materials_info = crafting_data['stock'][@workorders_materials['wood_type'] || 'maple']
+      skill = 'Engineering'
+      @engineering_room = @settings.engineering_room
+      tools = @settings.engineering_tools
+      @belt = @settings.engineering_belt
+      craft_method = :tinker_items
     else
       Lich::Messaging.msg('bold', 'WorkOrders: No discipline found')
       return
@@ -208,12 +253,18 @@ class WorkOrders
 
     return repair_items(info, tools) if repair
 
+    if continue_order && quantity.zero?
+      complete_work_order(info)
+      repair_items(info, tools) if @workorders_repair
+      return
+    end
+
     if DRSkill.getxp(skill) > @craft_max_mindstate
       Lich::Messaging.msg('bold', "WorkOrders: Exiting because your current mindstate for #{skill} (#{DRSkill.getxp(skill)}) is over the set maximum craft_max_mindstate: #{@craft_max_mindstate}")
       exit
     end
 
-    if turnin
+    if turnin && !continue_order
       quantity.times do
         DRCI.get_item(item['noun'], @settings.default_container)
         bundle_item(item['noun'], info['logbook'])
@@ -240,10 +291,83 @@ class WorkOrders
       end
       DRC.release_invisibility
       result = DRC.bput("give logbook to #{info['npc']}", *GIVE_LOGBOOK_SUCCESS_PATTERNS, NPC_NOT_FOUND_PATTERN)
+      if result.include?(GIVE_LOGBOOK_INCOMPLETE_PATTERN)
+        remaining = logbook_remaining(info['logbook'])
+        detail = remaining ? "still needs #{remaining} more" : 'is not complete'
+        Lich::Messaging.msg('bold', "WorkOrders: Work order #{detail} - not turned in")
+        stow_tool('logbook')
+        return
+      end
       break unless GIVE_LOGBOOK_RETRY_PATTERNS.any? { |pattern| pattern.is_a?(Regexp) ? pattern.match?(result) : result.include?(pattern) }
     end
     stow_tool('logbook')
     Lich::Messaging.msg('plain', 'WorkOrders: Work order completed and turned in')
+  end
+
+  # Read work-order logbook and return items still needed.
+  # @return [Integer, nil] remaining count, 0 if complete, nil if unreadable
+  def logbook_remaining(logbook)
+    result = DRC.bput("read my #{logbook} logbook", *READ_LOGBOOK_PATTERNS)
+    return 0 if result.include?('appears to be complete')
+
+    match = result.match(LOGBOOK_REMAINING_PATTERN)
+    return match[:remaining].to_i if match
+
+    nil
+  end
+
+  # Resume an in-progress work order from the discipline logbook.
+  # @return [Array(String, Integer)] recipe name and remaining quantity (0 if complete)
+  def resume_work_order(logbook, recipes)
+    unless DRCI.get_item?("#{logbook} logbook")
+      Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook")
+      exit
+    end
+
+    result = DRC.bput("read my #{logbook} logbook", *RESUME_LOGBOOK_PATTERNS)
+
+    if result.include?('appears to be complete')
+      stow_tool('logbook')
+      Lich::Messaging.msg('plain', 'WorkOrders: Logbook order complete - turning in')
+      return [nil, 0]
+    end
+
+    if result.include?('not currently tracking') || result.include?('has expired')
+      stow_tool('logbook')
+      Lich::Messaging.msg('bold', "WorkOrders: No in-progress work order in #{logbook} logbook")
+      exit
+    end
+
+    match = result.match(LOGBOOK_ITEM_PATTERN)
+    unless match
+      stow_tool('logbook')
+      Lich::Messaging.msg('bold', "WorkOrders: Could not parse item from #{logbook} logbook")
+      exit
+    end
+
+    item_desc = match[:item]
+    recipe = recipes.find { |r| r['name'] == item_desc }
+    unless recipe
+      stow_tool('logbook')
+      Lich::Messaging.msg('bold', "WorkOrders: Could not match logbook item '#{item_desc}' to a recipe")
+      exit
+    end
+
+    remaining = logbook_remaining(logbook)
+    stow_tool('logbook')
+
+    if remaining.nil?
+      Lich::Messaging.msg('bold', "WorkOrders: Could not read remaining count from #{logbook} logbook")
+      exit
+    end
+
+    if remaining.zero?
+      Lich::Messaging.msg('plain', 'WorkOrders: Logbook order complete - turning in')
+      return [recipe['name'], 0]
+    end
+
+    Lich::Messaging.msg('plain', "WorkOrders: Continuing work order for #{remaining} #{recipe['name']}")
+    [recipe['name'], remaining]
   end
 
   def get_tool(name)
@@ -255,6 +379,9 @@ class WorkOrders
   end
 
   def repair_items(info, tools)
+    skip = Array(@settings.workorders_no_repair_tools)
+    tools = tools.reject { |t| skip.any? { |s| t.include?(s) } } unless skip.empty?
+
     if @settings.workorders_repair_own_tools
       current = Room.current.id
       DRCM.ensure_copper_on_hand(1500, @settings, @hometown)
@@ -272,10 +399,9 @@ class WorkOrders
       if REPAIR_NO_NEED_PATTERNS.any? { |pat| pat.match?(result) }
         stow_tool(tool_name)
       elsif result.include?('give')
-        DRC.bput("give #{info['repair-npc']}", 'repair ticket')
-        unless DRCI.put_away_item?('ticket')
-          Lich::Messaging.msg('bold', 'WorkOrders: Failed to stow repair ticket')
-        end
+        confirm_repair(info, tool_name, repair_cost_copper(result))
+      else
+        stow_tool(tool_name)
       end
     end
 
@@ -287,6 +413,55 @@ class WorkOrders
       stow_tool(DRC.left_hand) if DRC.left_hand
     end
     Lich::Messaging.msg('plain', 'WorkOrders: Tool repair at NPC completed')
+  end
+
+  # Parse the copper cost out of the clerk's repair quote. Repair prices are
+  # quoted in the base coin of the local currency, so the number is already in
+  # coppers. Returns nil if no cost could be read.
+  def repair_cost_copper(quote)
+    match = quote.match(/([\d,]+)/)
+    match && match[1].delete(',').to_i
+  end
+
+  # Hand the item over to finalize a repair. If the clerk says we need more
+  # coin, withdraw 10x the quoted cost from the bank, walk back, and retry.
+  # Walking away and re-offering the tool restarts the clerk's two-give
+  # handshake, so after a bank run the next give is a fresh quote rather than
+  # the ticket; treat that quote as a normal step (refresh the cost and give
+  # again) instead of an unexpected response.
+  def confirm_repair(info, tool_name, cost)
+    attempts = 0
+    loop do
+      result = DRC.bput("give #{info['repair-npc']}", 'repair ticket', REPAIR_NEED_COIN_PATTERN, REPAIR_QUOTE_PATTERN, 'Just give it to me again')
+      case result
+      when /repair ticket/
+        break
+      when REPAIR_QUOTE_PATTERN, /Just give it to me again/
+        new_cost = repair_cost_copper(result)
+        cost = new_cost if new_cost
+      when /#{REPAIR_NEED_COIN_PATTERN}/
+        attempts += 1
+        if cost.nil? || attempts > 3
+          Lich::Messaging.msg('bold', "WorkOrders: Unable to fund repair of #{tool_name}; skipping.")
+          stow_tool(tool_name)
+          return
+        end
+        Lich::Messaging.msg('plain', "WorkOrders: Short on coin; withdrawing #{cost * 10} for #{tool_name} repair.")
+        stow_tool(tool_name)
+        unless DRCM.ensure_copper_on_hand(cost * 10, @settings, @hometown)
+          Lich::Messaging.msg('bold', "WorkOrders: Bank withdrawal failed; skipping #{tool_name} repair.")
+          return
+        end
+        DRCT.walk_to(info['repair-room'])
+        get_tool(tool_name)
+      else
+        Lich::Messaging.msg('bold', "WorkOrders: Unexpected response finalizing #{tool_name} repair; skipping.")
+        return
+      end
+    end
+    unless DRCI.put_away_item?('ticket')
+      Lich::Messaging.msg('bold', 'WorkOrders: Failed to stow repair ticket')
+    end
   end
 
   def find_recipe(materials_info, recipe, quantity)
@@ -698,7 +873,16 @@ class WorkOrders
 
     DRCM.ensure_copper_on_hand(@cash_on_hand || 5000, @settings, @hometown)
 
-    quantity.times do
+    max_attempts = quantity + FORGE_ATTEMPT_BUFFER
+    attempts = 0
+    while attempts < max_attempts
+      remaining = logbook_remaining(info['logbook'])
+      if remaining.nil?
+        Lich::Messaging.msg('bold', 'WorkOrders: Could not read forging logbook remaining count')
+        break
+      end
+      break if remaining.zero?
+
       if remaining_volume < recipe['volume']
         DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
         DRCT.order_item(info['stock-room'], materials_info['stock-number'])
@@ -710,7 +894,14 @@ class WorkOrders
       bundle_item(recipe['noun'], info['logbook'])
 
       remaining_volume -= recipe['volume']
+      attempts += 1
     end
+
+    remaining = logbook_remaining(info['logbook'])
+    if remaining&.positive?
+      Lich::Messaging.msg('bold', "WorkOrders: Forging finished but logbook still needs #{remaining} more")
+    end
+
     DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
   end
 
@@ -764,9 +955,24 @@ class WorkOrders
       exit
     end
 
-    quantity.times do
+    max_attempts = quantity + FORGE_ATTEMPT_BUFFER
+    attempts = 0
+    while attempts < max_attempts
+      remaining = logbook_remaining(info['logbook'])
+      if remaining.nil?
+        Lich::Messaging.msg('bold', 'WorkOrders: Could not read forging logbook remaining count')
+        break
+      end
+      break if remaining.zero?
+
       DRC.wait_for_script_to_complete('smith', [@use_own_ingot_type, item['name']])
       bundle_item(recipe['noun'], info['logbook'])
+      attempts += 1
+    end
+
+    remaining = logbook_remaining(info['logbook'])
+    if remaining&.positive?
+      Lich::Messaging.msg('bold', "WorkOrders: Forging finished but logbook still needs #{remaining} more")
     end
 
     if smelt
@@ -806,6 +1012,127 @@ class WorkOrders
     unless DRCI.put_away_item?('deed')
       Lich::Messaging.msg('bold', 'WorkOrders: Failed to stow deed')
     end
+  end
+
+  def tinker_items(info, materials_info, item, quantity)
+    recipe = find_recipe(materials_info, item, quantity).first
+    mechanism_ingot = @workorders_materials['mechanism_ingot_type'] || 'bronze'
+
+    info['trash-room'] = nil if @worn_trashcan && @worn_trashcan_verb
+
+    DRCM.ensure_copper_on_hand(@cash_on_hand || 5000, @settings, @hometown)
+
+    if recipe['part']
+      recipe['part'].reject { |p| p =~ /mechanism/i }.uniq.each do |part|
+        total_needed = recipe['part'].count { |p| p == part } * quantity
+        existing = DRCI.count_items_in_container(part, @bag)
+        deficit = total_needed - existing
+        order_parts([part], deficit) if deficit.positive?
+      end
+
+      mechanisms_needed = recipe['part'].count { |p| p =~ /mechanism/i } * quantity
+      if mechanisms_needed.positive?
+        mech_name = "#{mechanism_ingot} mechanisms"
+        consolidate_mechanisms(mech_name)
+        existing = count_mechanisms
+        deficit = mechanisms_needed - existing
+        if deficit > 0
+          mechanism_press_speed = (@workorders_materials['mechanism_press_speed'] || 5).to_i
+          num_presses = (deficit.to_f / 3).ceil
+          buy_mechanism_ingots(mechanism_ingot, num_presses)
+          DRCC.create_mechanisms(@settings, mechanism_ingot, num_presses, mechanism_press_speed)
+          consolidate_mechanisms(mech_name)
+          actual = count_mechanisms
+          if actual < mechanisms_needed
+            Lich::Messaging.msg('bold', "WorkOrders: Only #{actual} #{mechanism_ingot} mechanisms available, need #{mechanisms_needed}. Stopping. Automated buying is only done with bronze.")
+            exit
+          end
+        end
+      end
+    end
+
+    quantity.times do |count|
+      DRCI.stow_hands if count.positive?
+
+      DRCM.ensure_copper_on_hand(@cash_on_hand || 5000, @settings, @hometown)
+      DRCT.order_item(info['stock-room'], materials_info['stock-number'])
+      while DRC.bput("count my #{materials_info['stock-name']} lumber", 'You count.*\d+', 'I could not find').scan(/\d+/).first.to_i < recipe['volume']
+        DRCM.ensure_copper_on_hand(@cash_on_hand || 5000, @settings, @hometown)
+        DRCT.order_item(info['stock-room'], materials_info['stock-number'])
+        DRC.bput('combine', 'combine')
+      end
+      DRCC.stow_crafting_item("#{materials_info['stock-name']} lumber", @bag, @belt)
+
+      DRCC.find_shaping_room(@hometown, @engineering_room)
+      DRC.wait_for_script_to_complete('tinker', [recipe['chapter'], recipe['name'], materials_info['stock-name'], recipe['noun']])
+      bundle_item(recipe['noun'], info['logbook'])
+    end
+
+    DRCI.stow_hands
+    lumber_name = "#{materials_info['stock-name']} lumber"
+    while DRCI.exists?(lumber_name)
+      DRCT.dispose(lumber_name, info['trash-room'], @worn_trashcan, @worn_trashcan_verb)
+    end
+  end
+
+  def word_count_to_i(str)
+    ones = %w[zero one two three four five six seven eight nine ten eleven
+              twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen]
+    tens = { 'twenty' => 20, 'thirty' => 30, 'forty' => 40, 'fifty' => 50,
+             'sixty' => 60, 'seventy' => 70, 'eighty' => 80, 'ninety' => 90 }
+    total = 0
+    current = 0
+    str.downcase.gsub('-', ' ').split.each do |w|
+      if w == 'hundred'
+        current *= 100
+      elsif w == 'thousand'
+        total += current * 1000
+        current = 0
+      elsif (v = ones.index(w))
+        current += v
+      elsif (v = tens[w])
+        current += v
+      end
+    end
+    total + current
+  end
+
+  def buy_mechanism_ingots(material, count)
+    crafting_data = get_data('crafting')
+    stock = crafting_data['stock'] || {}
+    candidates = stock.select { |_k, v| v.is_a?(Hash) && v['stock-name'] == material }
+    return if candidates.empty?
+    _key, entry = candidates.min_by { |_k, v| (v['volume'].to_i - 5).abs }
+    stock_room = crafting_data['blacksmithing'][@hometown]['stock-room']
+    existing = DRCI.count_items_in_container("#{material} ingot", @bag).to_i
+    to_buy = count - existing
+    to_buy.times do
+      DRCM.ensure_copper_on_hand(@cash_on_hand || 5000, @settings, @hometown)
+      DRCT.order_item(stock_room, entry['stock-number'])
+      DRCC.stow_crafting_item("#{material} ingot", @bag, nil)
+    end
+  end
+
+  def consolidate_mechanisms(mech_name)
+    loop do
+      break unless DRC.bput("get my #{mech_name} from my #{@bag}", /^You get/, /^I could not find/, /^What were/) =~ /^You get/
+      got_second = DRC.bput("get my #{mech_name} from my #{@bag}", /^You get/, /^I could not find/, /^What were/) =~ /^You get/
+      fput('combine') if got_second
+      DRCC.stow_crafting_item(mech_name, @bag, nil)
+      break unless got_second
+    end
+  end
+
+  def count_mechanisms
+    material = @workorders_materials['mechanism_ingot_type'] || 'bronze'
+    result = DRC.bput("count #{material} mechanisms in my #{@bag}",
+                      /There are .+ mechanisms left/i,
+                      /There is .+ mechanism left/i,
+                      /I could not find/i,
+                      /What were/i)
+    return 0 unless result =~ /There are (.+?) mechanisms left|There is (.+?) mechanism/i
+
+    word_count_to_i((Regexp.last_match(1) || Regexp.last_match(2)).strip)
   end
 
   def enchanting_items(info, _materials_info, recipe, quantity)

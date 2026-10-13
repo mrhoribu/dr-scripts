@@ -191,6 +191,7 @@ metal_types:
 - agonite
 - aldamdin
 - animite
+- atheldalm
 - audrualm
 - coralite
 - damite
@@ -213,6 +214,7 @@ metal_types:
 - orichalcum
 - platinum
 - quelium
+- selatila
 - silversteel
 - telothian
 - tomiek
@@ -272,7 +274,7 @@ lumber_types:
 - cherry # longbows
 - copperwood # longbows
 - crabwood # martial
-- darkspine	# martial
+- darkspine # martial
 - diamondwood # martial
 - dragonwood # alterations
 - e'erdream # ???
@@ -290,14 +292,14 @@ lumber_types:
 - lelori #composite
 - macawood #alterations
 - mistwood # longbow, shortbow
-- osage	# longbows
+- osage # longbows
 - ramin # longbows
 - redwood # alterations
 - rockwood # martial
 - rosewood # longbows
 - shadowbark # ???
 - silverwood # shortbows, composite bows
-- smokewood	# alterations
+- smokewood # alterations
 - tamarak # alterations
 - tamboti # ???
 - yew # longbows

@@ -301,11 +301,9 @@ class SetupProcess
   end
 
   def last_stance
-    flag_result = Flags['last-stance']
-    return { 'EVASION' => 0, 'PARRY' => 0, 'SHIELD' => 0, 'SPARE' => 0 } unless flag_result
+    return { 'EVASION' => 0, 'PARRY' => 0, 'SHIELD' => 0, 'SPARE' => 0 } unless Flags['last-stance']
 
-    flag_result[0] =~ /(\d+)%.* (\d+)%.* (\d+)%.* (\d+)/
-    { 'EVASION' => Regexp.last_match(1).to_i, 'PARRY' => Regexp.last_match(2).to_i, 'SHIELD' => Regexp.last_match(3).to_i, 'SPARE' => Regexp.last_match(4).to_i }
+    { 'EVASION' => Flags['last-stance'][:evasion].to_i, 'PARRY' => Flags['last-stance'][:parry].to_i, 'SHIELD' => Flags['last-stance'][:shield].to_i, 'SPARE' => Flags['last-stance'][:spare].to_i }
   end
 
   def build_stance_string(vals)
@@ -515,6 +513,12 @@ class LootProcess
     @dissect_and_butcher = settings.dissect_and_butcher
     echo("  @dissect_and_butcher: #{@dissect_and_butcher}") if $debug_mode_ct
 
+    # Optional cap on butchers per corpse. nil = butcher until exhausted
+    # ("much too battered..."). Set to 1 for legacy one-butcher-then-dissect
+    # when dissect_and_butcher and ritual_type is not butcher.
+    @butcher_count = thanatology['butcher_count']
+    echo("  @butcher_count: #{@butcher_count}") if $debug_mode_ct
+
     @rituals = get_data('spells').rituals
     echo("  @rituals: #{@rituals}") if $debug_mode_ct
 
@@ -622,6 +626,19 @@ class LootProcess
     Flags.add('pouch-needs-tie', /You'd better tie it up before putting/)
     Flags.add('container-full', 'There isn\'t any more room')
     Flags.add('ct-successful-skin', '^You carefully fit .* into your bundle')
+
+    # Corpse ids we've finished a given action on. A looted corpse lingers in
+    # Creature.in_room(:dead) until it DECAYS (~6-7s after loot, several
+    # crtrStatus pulses later), so corpse_present? alone can't stop us
+    # re-arranging/re-skinning/re-dissecting/re-looting it -- track each action
+    # per id and skip it. Marked on terminal outcomes only (success or
+    # already-done), not on retryable ones. dispose_body prunes each list every
+    # pass to the ids still present in the dead roster, so they stay bounded to
+    # the current room's corpses -- an id no longer in the room is a corpse that
+    # has decayed and is gone, so we no longer need to track it.
+    @skinned_corpse_ids = []
+    @dissected_corpse_ids = []
+    @looted_corpse_ids = []
   end
 
   def execute(game_state)
@@ -776,6 +793,11 @@ class LootProcess
     tried_loot = false
     items_to_loot = []
     @lootables
+      # Drop blank/nil entries first: an empty line in a profile's loot_additions
+      # YAML parses to nil, which crashes on item.split below (and lootable?'s
+      # downcase), while an empty string builds a bare "stow " that the game
+      # applies to whatever is in hand -- stowing the character's weapon.
+      .reject { |item| item.to_s.strip.empty? }
       .select { |item| game_state.lootable?(item) }
       .reject { |item| @box_nouns.include?(item) && @box_loot_limit && at_box_limit? }
       .each do |item|
@@ -854,19 +876,20 @@ class LootProcess
   def check_rituals?(game_state)
     return true unless DRStats.necromancer?
 
-    mob_noun = DRRoom.dead_npcs.first
-    return true if game_state.construct?(mob_noun)
+    corpse = Lich::DragonRealms::Creature.in_room(:dead).first
+    return true if corpse.nil?
+    return true if game_state.construct?(corpse.noun)
 
     echo "  should_perform_ritual? #{should_perform_ritual?(game_state)}" if $debug_mode_ct
     if @last_ritual.nil?
       if @necro_corpse_priority == 'pet'
         echo "Prioritizing pet creation over healing" if $debug_mode_ct
-        check_necro_pet(mob_noun, game_state)
-        check_necro_heal(mob_noun, game_state)
+        check_necro_pet(corpse, game_state)
+        check_necro_heal(corpse, game_state)
       elsif @necro_corpse_priority == 'heal' || !@necro_corpse_priority
         echo "Prioritizing healing over pet creation" if $debug_mode_ct
-        check_necro_heal(mob_noun, game_state)
-        check_necro_pet(mob_noun, game_state)
+        check_necro_heal(corpse, game_state)
+        check_necro_pet(corpse, game_state)
       end
       ritual = if @redeemed
                  'dissect'
@@ -879,14 +902,14 @@ class LootProcess
                else
                  @ritual_type
                end
-      do_necro_ritual(mob_noun, ritual, game_state) if should_perform_ritual?(game_state)
+      do_necro_ritual(corpse, ritual, game_state) if should_perform_ritual?(game_state)
     end
     return false if %w[consume harvest dissect].include?(@last_ritual)
 
     true
   end
 
-  def check_necro_heal(mob_noun, game_state)
+  def check_necro_heal(corpse, game_state)
     if @necro_heal && !game_state.necro_casting?
       game_state.wounds = DRCH.check_health['wounds']
       echo "Severity to Wounds: #{game_state.wounds}" if $debug_mode_ct
@@ -896,42 +919,59 @@ class LootProcess
         # flag set but no CF/devour cast to clear hence blocking looting (and potentially other necro_casting defs)
         # the check for !devour will also disallow concurrent use of devour and CF but that is not currently supported in CT @ 2/2/2025
         if @wound_level_threshold <= game_state.wounds.keys.max && !DRSpells.active_spells['Devour']
-          do_necro_ritual(mob_noun, 'consume', game_state)
+          do_necro_ritual(corpse, 'consume', game_state)
           return false
         end
       end
     end
   end
 
-  def check_necro_pet(mob_noun, game_state)
+  def check_necro_pet(corpse, game_state)
     if @make_zombie && !game_state.necro_casting? && !game_state.cfb_active?
       echo 'Making zombie' if $debug_mode_ct
-      do_necro_ritual(mob_noun, 'arise', game_state)
+      do_necro_ritual(corpse, 'arise', game_state)
       return false
     end
     if @make_bonebug && !game_state.necro_casting? && !game_state.cfw_active?
       echo 'Making bone bug' if $debug_mode_ct
-      do_necro_ritual(mob_noun, 'arise', game_state)
+      do_necro_ritual(corpse, 'arise', game_state)
       return false
     end
   end
 
-  def do_necro_ritual(mob_noun, ritual, game_state)
+  # Matchers for ritual targeting that hit a missing noun or a living creature.
+  # Listed before @rituals['failures'] so "on a corpse" wins over the shorter
+  # "This ritual may only be performed on" failure substring.
+  def necro_wrong_corpse_matchers
+    [
+      'What were you referring to',
+      'I could not find what you were referring to',
+      'This ritual may only be performed on a corpse'
+    ]
+  end
+
+  def necro_wrong_corpse_target?(result)
+    return false if result.nil? || result.empty?
+
+    necro_wrong_corpse_matchers.any? { |msg| result.include?(msg) }
+  end
+
+  def do_necro_ritual(corpse, ritual, game_state)
     return unless DRStats.necromancer?
     return unless ritual
-    return if game_state.construct?(mob_noun)
+    return if game_state.construct?(corpse.noun)
 
-    echo "Attempting necromancer ritual #{ritual} on #{mob_noun}" if $debug_mode_ct
+    echo "Attempting necromancer ritual #{ritual} on #{corpse.name || corpse.noun} (##{corpse.id})" if $debug_mode_ct
 
     if ritual.eql?('butcher')
-      butcher_corpse(mob_noun, ritual, game_state)
+      butcher_corpse(corpse, ritual, game_state)
       echo "Last ritual performed: #{@last_ritual}" if $debug_mode_ct
       return
     end
 
-    do_necro_ritual(mob_noun, 'preserve', game_state) if %w[consume harvest arise].include?(ritual)
-    perform_message = "perform #{ritual} on #{mob_noun}"
-    result = DRC.bput(perform_message, @rituals['arise'], @rituals['preserve'], @rituals['dissect'], @rituals['harvest'], @rituals['consume'], @rituals['construct'], @rituals['failures'])
+    do_necro_ritual(corpse, 'preserve', game_state) if %w[consume harvest arise].include?(ritual)
+    perform_message = "perform #{ritual} on ##{corpse.id}"
+    result = DRC.bput(perform_message, @rituals['arise'], @rituals['preserve'], @rituals['dissect'], @rituals['harvest'], @rituals['consume'], @rituals['construct'], necro_wrong_corpse_matchers, @rituals['failures'])
     echo result if $debug_mode_ct
     case result
     when @rituals['arise']
@@ -954,32 +994,85 @@ class LootProcess
       necro_harvest_check
     when @rituals['construct']
       echo 'Detected an attempt to do ritual on a construct' if $debug_mode_ct
-      game_state.construct(mob_noun)
+      game_state.construct(corpse.noun)
+    when *necro_wrong_corpse_matchers
+      DRC.message("*** combat-trainer: #{ritual} failed - wrong/missing corpse target (tried '#{corpse.name || corpse.noun}' ##{corpse.id})")
     when *@rituals['failures']
       echo 'Failure detected' if $debug_mode_ct
     end
     echo "Last ritual performed: #{@last_ritual}" if $debug_mode_ct
   end
 
-  def butcher_corpse(mob_noun, ritual, game_state)
+  def butcher_corpse(corpse, ritual, game_state)
     return unless ritual.eql?('butcher')
 
-    echo "Butchering the #{mob_noun}'s corpse!" if $debug_mode_ct
-    echo ' Only butchering it once!' if $debug_mode_ct && @dissect_and_butcher && !@ritual_type.eql?('butcher')
+    echo "Butchering the #{corpse.name || corpse.noun}'s corpse! (##{corpse.id})" if $debug_mode_ct
+    # Order: preserve -> butcher until exhausted -> dissect (if dissect_and_butcher).
+    # Natural stop: "much too battered and beat up to extract any body parts from."
+    # Optional thanatology.butcher_count caps butchers before that. Legacy one-shot
+    # only when dissect_and_butcher, ritual_type != butcher, and butcher_count == 1.
+    single_butcher = @dissect_and_butcher && !@ritual_type.eql?('butcher') && @butcher_count == 1
+    echo ' Only butchering it once!' if $debug_mode_ct && single_butcher
+
+    # Butcher-exhausted: stop butchering but corpse may still accept dissection.
+    butcher_exhausted = [
+      'much too battered and beat up to extract any body parts from',
+      'renders it useless for butchering'
+    ]
+    # Corpse ruined for further rituals - skip dissect.
+    corpse_ruined_for_rituals = [
+      'You realize the unfortunate butchery ruins the body for any further attempts at rituals',
+      'A failed or completed ritual has rendered this corpse unusable for your purpose',
+      'prevents a meaningful dissection'
+    ]
 
     @equipment_manager.stow_weapon(game_state.weapon_name)
 
-    loop do
-      result = DRC.bput("perform #{ritual} on #{mob_noun}", @rituals['butcher'], @rituals['failures'], @rituals['construct'])
-      game_state.construct(mob_noun) if result.include?(@rituals['construct'])
-      @last_ritual = 'butcher' if result.include?(@rituals['butcher'])
-      break if result.empty? || @rituals['failures'].any? { |msg| result.include?(msg) || result.include?(@rituals['construct']) }
+    # Preserve first - extends part decay and marks the corpse for butchery.
+    do_necro_ritual(corpse, 'preserve', game_state)
 
-      DRC.bput("drop my #{DRC.right_hand}", 'You drop', 'You discard', 'Please rephrase')
-      break if @dissect_and_butcher && !@ritual_type.eql?('butcher')
+    butchers_done = 0
+    skip_dissect = false
+    loop do
+      result = DRC.bput("perform #{ritual} on ##{corpse.id}", @rituals['butcher'], necro_wrong_corpse_matchers, @rituals['failures'], @rituals['construct'])
+      game_state.construct(corpse.noun) if result.include?(@rituals['construct'])
+      @last_ritual = 'butcher' if result.include?(@rituals['butcher'])
+
+      if result.empty? || result.include?(@rituals['construct'])
+        skip_dissect = true
+        break
+      end
+
+      if necro_wrong_corpse_target?(result)
+        DRC.message("*** combat-trainer: #{ritual} failed - wrong/missing corpse target (tried '#{corpse.name || corpse.noun}' ##{corpse.id})")
+        skip_dissect = true
+        break
+      end
+
+      if butcher_exhausted.any? { |msg| result.include?(msg) }
+        echo "  Butcher exhausted (#{result}); continuing to dissect" if $debug_mode_ct
+        break
+      end
+
+      if corpse_ruined_for_rituals.any? { |msg| result.include?(msg) }
+        echo "  Corpse ruined for rituals (#{result}); skipping dissect" if $debug_mode_ct
+        skip_dissect = true
+        break
+      end
+
+      if @rituals['failures'].any? { |msg| result.include?(msg) }
+        skip_dissect = true
+        break
+      end
+
+      DRC.bput("drop my #{DRC.right_hand}", 'You drop', 'You discard', 'Please rephrase', 'What were you referring to') if DRC.right_hand
+      butchers_done += 1
+      break if single_butcher
+      break if @butcher_count && butchers_done >= @butcher_count
     end
 
-    do_necro_ritual(mob_noun, 'dissect', game_state) if @dissect_and_butcher && !@ritual_type.eql?('butcher')
+    # Dissect last when requested and the corpse is still usable.
+    do_necro_ritual(corpse, 'dissect', game_state) if @dissect_and_butcher && !skip_dissect
     @equipment_manager.wield_weapon?(game_state.weapon_name, game_state.weapon_skill)
   end
 
@@ -1025,8 +1118,52 @@ class LootProcess
     waitrt?
     return if Flags['using-corpse']
 
-    if (Time.now - @last_rites_timer > 600) && @last_rites && game_state.blessed_room
-      DRC.bput("pray #{DRRoom.dead_npcs.first}", 'You beseech your god for mercy', 'You pray fervently', 'You continue praying for guidance', 'Quietly touching your lips with the tips of your fingers', 'murmur a brief prayer for')
+    # Target the specific dead body by its stable <crtrStatus> id, not the bare
+    # DRRoom.dead_npcs noun -- with a live same-noun mob in the room the noun can
+    # bind to the living creature. DRRoom.dead_npcs still gates presence above.
+    #
+    # Pick the first corpse we have NOT already looted, not just the roster's
+    # first. A looted corpse lingers dead in the roster (~6-7s until it decays),
+    # and the roster is ordered oldest-id-first, so a stale already-looted body
+    # sits at the head and would otherwise block every newer corpse behind it
+    # until it decays -- one dead body per decay window instead of looting them
+    # as they fall. Skipping looted ids here advances to the next lootable corpse
+    # each pass (necromancer corpses are consumed by rituals, never looted, so
+    # they are never in @looted_corpse_ids and this reject leaves them untouched).
+    dead_corpses = Lich::DragonRealms::Creature.in_room(:dead)
+
+    # Prune the per-corpse action trackers to corpses still present. Every pulse
+    # rebuilds the dead roster, so an id we recorded that is no longer in it is a
+    # corpse that has decayed away and is done with -- drop it. This only sheds
+    # dead weight and keeps the lists bounded to the current room (never a whole
+    # session). Selection/skip behaviour is unchanged: the ids removed here are
+    # exactly the ones no longer in dead_corpses, which selection ignores anyway.
+    present_ids = dead_corpses.map(&:id)
+    @looted_corpse_ids &= present_ids
+    @skinned_corpse_ids &= present_ids
+    @dissected_corpse_ids &= present_ids
+
+    corpse = dead_corpses.reject { |c| @looted_corpse_ids.include?(c.id) }.first
+
+    # Every corpse the roster still knows about is one we have already looted (a
+    # looted body lingers dead until it decays). Nothing left to do this pass --
+    # return rather than fall through, so we do not re-fire a bare `loot` at an
+    # already-searched corpse every tick. A genuinely empty roster (corpse nil
+    # AND no dead corpses) still falls through: DRRoom.dead_npcs said a body is
+    # here, so the two feeds disagree and the bare-loot fallback below covers it.
+    if corpse.nil? && !dead_corpses.empty?
+      @last_ritual = nil
+      # Reset the loot timer like every other exit that gets past the gate above,
+      # so @loot_delay throttles this no-op path too. Without it, at loot_delay > 0
+      # the prune + selection re-runs every tick while already-looted corpses
+      # linger (~6-7s until decay) instead of once per loot_delay. Harmless at
+      # loot_delay: 0, where the gate never blocks and every tick runs regardless.
+      @loot_timer = Time.now
+      return
+    end
+
+    if corpse && (Time.now - @last_rites_timer > 600) && @last_rites && game_state.blessed_room
+      DRC.bput("pray ##{corpse.id}", 'You beseech your god for mercy', 'You pray fervently', 'You continue praying for guidance', 'Quietly touching your lips with the tips of your fingers', 'murmur a brief prayer for')
       waitrt?
       fput "recite Meraud, power the holy fires that unleash my righteous vengeance;Chadatru, guide my sword to swing in justice;Everild, give me the power to conquer my enemies;Truffenyi, let me not lose sight of compassion and mercy;Else, I will become like those I despise;Urrem'tier, receive into your fetid grasp these wicked souls;May the Tamsine's realms never know their evil ways again;May all the Immortals guide your faithful soldier #{checkname}."
       waitrt?
@@ -1036,34 +1173,80 @@ class LootProcess
 
     game_state.sheath_whirlwind_offhand
 
-    echo("DRRoom.dead_npcs.first is: #{DRRoom.dead_npcs.first}") if $debug_mode_ct
-    skin_or_dissect(DRRoom.dead_npcs.first, game_state) if check_rituals?(game_state)
+    echo("corpse: #{corpse&.name || corpse&.noun} (##{corpse&.id})") if $debug_mode_ct
+    skin_or_dissect(corpse, game_state) if corpse && check_rituals?(game_state)
 
     game_state.wield_whirlwind_offhand
 
     unless game_state.necro_casting?
-      while DRC.bput("loot #{@custom_loot_type}".strip, 'You search', 'I could not find what you were referring to', 'and get ready to search it') == 'and get ready to search it'
+      # Loot the specific corpse by its <crtrStatus> id so we know exactly which
+      # body we consumed -- a looted corpse disappears very shortly after. The
+      # corpse selected above is always one we have NOT looted yet, so we loot it
+      # unconditionally here and record its id. Fall back to a bare/typed loot
+      # when no id is known (corpse nil: the Creature roster and DRRoom.dead_npcs
+      # can disagree). @custom_loot_type, when set, still selects the LOOT type
+      # (treasure/equipment/all).
+      loot_target = corpse ? "##{corpse.id}" : nil
+      loot_command = ['loot', loot_target, @custom_loot_type].compact.reject(&:empty?).join(' ')
+      # 'already been searched' terminates the loop too: with loot-by-id a
+      # group-mate can search the corpse first, and the game replies "The <mob>
+      # has already been searched for that!" -- unmatched, that hangs bput for
+      # its full 15s timeout mid-combat.
+      while DRC.bput(loot_command, 'You search', 'I could not find what you were referring to', 'and get ready to search it', 'already been searched') == 'and get ready to search it'
         pause
         waitrt?
+      end
+      if corpse
+        @looted_corpse_ids << corpse.id
+        echo("corpse-track: mark ##{corpse.id} looted") if $debug_mode_ct
       end
       @last_ritual = nil
     end
     @loot_timer = Time.now
   end
 
-  def arrange_mob(mob_noun, game_state)
+  # Whether a specific corpse (by its <crtrStatus> id) is still present in the
+  # room. Looting a corpse makes it vanish very shortly after, so arrange/skin
+  # must confirm the id is still around before firing a command at a corpse that
+  # may already be gone -- otherwise the bare verb returns "Arrange what?" /
+  # "Skin what?" and burns roundtime mid-combat.
+  def corpse_present?(corpse)
+    return false unless corpse
+
+    Lich::DragonRealms::Creature.in_room(:dead).any? { |c| c.id == corpse.id }
+  end
+
+  def arrange_mob(mob_noun, game_state, corpse)
     return unless @skin || @arrange_for_dissect
     return unless @arrange_count > 0
     return unless game_state.skinnable?(mob_noun)
     return if game_state.necro_casting?
+    return unless corpse_present?(corpse)
+    if corpse && @skinned_corpse_ids.include?(corpse.id)
+      echo("corpse-track: skip arrange ##{corpse.id} (already skinned)") if $debug_mode_ct
+      return
+    end
 
     arranges = 0
     type = @arrange_types[mob_noun] || 'skin'
-    arrange_message = @arrange_all ? "arrange all for #{type}" : "arrange for #{type}"
+    # Target the specific corpse by id (e.g. "arrange #12345 for skin") so the
+    # verb can't bind to a live same-noun mob or the wrong corpse. "all" (arrange
+    # up to five times in one command, at a higher roundtime) goes *before* the
+    # id: "arrange all #12345 for skin". Putting it after the id ("arrange #12345
+    # all") silently drops the "all" and arranges only once. The noun->type
+    # lookup above is unchanged.
+    arrange_verb = @arrange_all ? "arrange all ##{corpse.id}" : "arrange ##{corpse.id}"
+    arrange_message = "#{arrange_verb} for #{type}"
     while arranges < @arrange_count
-      arranges += 1 # rubocop:disable Lint/UselessAssignment
-      case DRC.bput(arrange_message, 'You begin to arrange', 'You continue arranging', 'You make a mistake', 'You complete arranging', 'That creature cannot', 'That has already been arranged', 'Arrange what', 'cannot be skinned', 'You make a serious mistake in the arranging process', 'The .* is currently being arranged to produce')
+      arranges += 1
+      case DRC.bput(arrange_message, 'You begin to arrange', 'You continue arranging', 'You make a mistake', 'You complete arranging', 'That creature cannot', 'That has already been arranged', 'Arrange what', 'cannot be skinned', 'already been skinned', 'You make a serious mistake in the arranging process', 'The .* is currently being arranged to produce')
       when 'You complete arranging', 'That has already been arranged', 'You make a serious mistake in the arranging process', 'Arrange what'
+        break
+      when 'already been skinned'
+        if corpse
+          @skinned_corpse_ids << corpse.id
+          echo("corpse-track: mark ##{corpse.id} skinned (via arrange)") if $debug_mode_ct
+        end
         break
       when 'cannot be skinned'
         game_state.unskinnable(mob_noun)
@@ -1072,12 +1255,13 @@ class LootProcess
         break
       when 'That creature cannot'
         arranges = 0
-        arrange_message = @arrange_all ? 'arrange all' : 'arrange'
+        arrange_message = arrange_verb
       end
     end
   end
 
-  def skin_or_dissect(mob_noun, game_state)
+  def skin_or_dissect(corpse, game_state)
+    mob_noun = corpse&.noun
     return unless (game_state.dissectable?(mob_noun) || game_state.skinnable?(mob_noun))
     return unless (@dissect || @skin)
 
@@ -1085,7 +1269,7 @@ class LootProcess
 
     if @dissect && game_state.dissectable?(mob_noun)
       if @arrange_for_dissect
-        arrange_mob(mob_noun, game_state)
+        arrange_mob(mob_noun, game_state, corpse)
         already_arranged = true
       end
 
@@ -1096,24 +1280,31 @@ class LootProcess
       end
 
       if skill_to_train == 'First Aid' || skill_to_train == 'Thanatology'
-        unless dissected?(mob_noun, game_state)
-          arrange_mob(mob_noun, game_state) unless already_arranged
-          check_skinning(mob_noun, game_state) if @skin
+        unless dissected?(corpse, game_state)
+          arrange_mob(mob_noun, game_state, corpse) unless already_arranged
+          check_skinning(mob_noun, game_state, corpse) if @skin
         end
       elsif skill_to_train == 'Skinning'
-        arrange_mob(mob_noun, game_state) unless already_arranged
-        check_skinning(mob_noun, game_state) if @skin
+        arrange_mob(mob_noun, game_state, corpse) unless already_arranged
+        check_skinning(mob_noun, game_state, corpse) if @skin
       end
     elsif @skin && game_state.skinnable?(mob_noun)
-      arrange_mob(mob_noun, game_state) unless already_arranged
-      check_skinning(mob_noun, game_state)
+      arrange_mob(mob_noun, game_state, corpse) unless already_arranged
+      check_skinning(mob_noun, game_state, corpse)
     else
       return
     end
   end
 
-  def dissected?(mob_noun, game_state)
+  def dissected?(corpse, game_state)
+    mob_noun = corpse&.noun
     return unless game_state.dissectable?(mob_noun)
+    # Already dissected this corpse -> it's dissected; don't re-fire dissect at a
+    # corpse still lingering dead in the roster until it decays.
+    if corpse && @dissected_corpse_ids.include?(corpse.id)
+      echo("corpse-track: skip dissect ##{corpse.id} (already dissected)") if $debug_mode_ct
+      return true
+    end
 
     if @dissect_for_thanatology
       return false if (DRSkill.getxp('Thanatology') == 34 && DRSkill.getxp('First Aid') == 34)
@@ -1121,7 +1312,10 @@ class LootProcess
       return false if DRSkill.getxp('First Aid') == 34
     end
 
-    case DRC.bput("dissect #{mob_noun}",
+    # Address the specific corpse by id; a nil corpse (the retry below) falls back
+    # to a bare `dissect` on the game's current corpse, as before.
+    dissect_command = corpse ? "dissect ##{corpse.id}" : 'dissect'
+    case DRC.bput(dissect_command,
                   /You'll gain no insights from this attempt/,
                   /You succeed in dissecting the corpse/,
                   'What exactly are you trying to dissect',
@@ -1141,6 +1335,10 @@ class LootProcess
                   "With less concern than you'd give a fresh corpse",
                   'Rituals do not work upon constructs')
     when /You succeed in dissecting the corpse/, /You learn something/i, "With less concern than you'd give a fresh corpse"
+      if corpse
+        @dissected_corpse_ids << corpse.id
+        echo("corpse-track: mark ##{corpse.id} dissected") if $debug_mode_ct
+      end
       return true
     when /You'll gain no insights from this attempt/
       waitrt?
@@ -1149,23 +1347,28 @@ class LootProcess
     when 'This ritual may only be performed on a corpse', 'A failed or completed ritual has rendered', 'You realize after a few seconds', 'prevents a meaningful dissection'
       return false
     when 'Rituals do not work upon constructs'
-      game_state.construct(mob_noun)
-      game_state.undissectable(mob_noun)
+      game_state.construct(mob_noun) if mob_noun
+      game_state.undissectable(mob_noun) if mob_noun
       return false
     when 'While likely a fascinating study', "That'd be a waste of time.", 'You do not yet possess the knowledge'
-      game_state.undissectable(mob_noun)
+      game_state.undissectable(mob_noun) if mob_noun
       @dissect_cycle_skills.delete("First Aid")
       @dissect_cycle_skills.delete("Thanatology") if @dissect_for_thanatology
       @dissect = false
       return false
     when 'would probably object', "should be left alone."
-      return dissected?('', game_state)
+      return dissected?(nil, game_state)
     end
     return false
   end
 
-  def check_skinning(mob_noun, game_state)
+  def check_skinning(mob_noun, game_state, corpse)
     return unless game_state.skinnable?(mob_noun)
+    return unless corpse_present?(corpse)
+    if corpse && @skinned_corpse_ids.include?(corpse.id)
+      echo("corpse-track: skip skin ##{corpse.id} (already skinned)") if $debug_mode_ct
+      return
+    end
 
     if game_state.need_bundle
       case DRC.bput('tap my bundle', 'You tap a \w+ bundle\b.*that you are wearing', 'I could not find what you were referring to', 'You tap a tight bundle inside')
@@ -1200,11 +1403,22 @@ class LootProcess
     end
 
     snap = [DRC.left_hand, DRC.right_hand]
-    case DRC.bput('skin', 'roundtime', 'skin what', 'cannot be skinned', 'carrying far too many items', 'need a more appropriate weapon', 'need to have a bladed instrument to skin', 'You must have one hand free to skin')
+    case DRC.bput("skin ##{corpse.id}", 'roundtime', 'skin what', 'cannot be skinned', 'already been skinned', 'carrying far too many items', 'need a more appropriate weapon', 'need to have a bladed instrument to skin', 'You must have one hand free to skin')
+    when /roundtime/i
+      # Skin started -> this corpse is done; don't re-arrange/re-skin it while it
+      # lingers dead in the roster for the ~6-7s until it decays. NB: DRC.bput
+      # returns the matched substring from the game line ("Roundtime"), not the
+      # matcher, so this branch must be case-insensitive, not `when 'roundtime'`.
+      @skinned_corpse_ids << corpse.id
+      echo("corpse-track: mark ##{corpse.id} skinned") if $debug_mode_ct
+    when 'already been skinned'
+      @skinned_corpse_ids << corpse.id
+      echo("corpse-track: mark ##{corpse.id} skinned (already)") if $debug_mode_ct
+      return
     when 'You must have one hand free to skin'
       temp_item = DRC.left_hand
       if DRCI.lower_item?(temp_item)
-        check_skinning(mob_noun, game_state)
+        check_skinning(mob_noun, game_state, corpse)
         DRCI.get_item?(temp_item)
       end
     when 'need a more appropriate weapon', 'need to have a bladed instrument to skin'
@@ -1267,55 +1481,58 @@ class SafetyProcess
     @equipment_manager = equipment_manager
     @health_threshold = settings.health_threshold
     @stop_on_bleeding = settings.stop_hunting_if_bleeding
-    @safety_untendable_threshold = settings.safety_untendable_threshold || 3
+    @safety_exit_when_stunned = settings.safety_exit_when_stunned || false
+    # Deprecated: safety_exit_on_bleeding used to mean "stop on bleed AND on stun-at-low-
+    # health". Those are now the separate stop_hunting_if_bleeding and safety_exit_when_stunned
+    # settings; we still honor the old one (it drives both -- see bleed_stop_enabled? and
+    # stunned_at_low_health?) so existing profiles keep working.
     @safety_exit_on_bleeding = settings.safety_exit_on_bleeding || false
+    if @safety_exit_on_bleeding
+      DRC.message("*** combat-trainer: 'safety_exit_on_bleeding' is deprecated -- use 'stop_hunting_if_bleeding' (stop on bleed) and/or 'safety_exit_when_stunned' (stop when stunned at low vitality). Still honoring it for now.")
+    end
+    # Removed: safety_untendable_threshold gated an unreliable tend-failure counter that never
+    # reliably stopped the hunt. It is no longer read -- stop_hunting_if_bleeding now stops on
+    # bleeding directly -- so warn anyone whose profile still carries it.
+    unless settings.safety_untendable_threshold.nil?
+      DRC.message("*** combat-trainer: 'safety_untendable_threshold' has been removed and is ignored -- combat-trainer now stops on bleeding via 'stop_hunting_if_bleeding' (with its heal-over-time grace). Remove it from your profile.")
+    end
     @safety_concentration_minimum = settings.safety_concentration_minimum
     @safety_escape_health_threshold = settings.safety_escape_health_threshold
     echo("  @health_threshold: #{@health_threshold}") if $debug_mode_ct
-    echo("  @safety_untendable_threshold: #{@safety_untendable_threshold}") if $debug_mode_ct
     echo("  @safety_exit_on_bleeding: #{@safety_exit_on_bleeding}") if $debug_mode_ct
+    echo("  @safety_exit_when_stunned: #{@safety_exit_when_stunned}") if $debug_mode_ct
     echo("  @safety_concentration_minimum: #{@safety_concentration_minimum}") if $debug_mode_ct
     echo("  @safety_escape_health_threshold: #{@safety_escape_health_threshold}") if $debug_mode_ct
-    @untendable_counter = 0
   end
 
   def execute(game_state)
-    # Reset the failure count whenever we are not actively bleeding, so a stale
-    # count from an earlier, since-resolved bleed cannot trip the stop below.
-    @untendable_counter = 0 unless bleeding?
-    if @untendable_counter >= @safety_untendable_threshold && @stop_on_bleeding
-      echo('Skipping tendme check due to untendable backoff') if $debug_mode_ct
-      echo("Couldn't tend bleeders after trying #{@safety_untendable_threshold} time(s). Stopping hunt. Get healed!")
-      $HUNTING_BUDDY.stop_hunting
-      $COMBAT_TRAINER.stop
-    elsif @safety_concentration_minimum && DRStats.concentration < @safety_concentration_minimum
-      echo("Concentration below #{@safety_concentration_minimum}. Stopping hunt.")
-      $HUNTING_BUDDY.stop_hunting
-      $COMBAT_TRAINER.stop
-    elsif @safety_escape_health_threshold && DRStats.thief? && DRSpells.known_spells['Vanish'] && (bleeding? || stunned? || DRStats.health < @safety_escape_health_threshold)
-      pause 0.1 while stunned?
-      echo("Bleeding. Activating Vanish and stopping hunt.") if bleeding?
-      echo("Stunned. Activating Vanish and stopping hunt.") if stunned?
-      echo("Health below #{@safety_escape_health_threshold}. Activating Vanish and stopping hunt.") if DRStats.health < @safety_escape_health_threshold
-      DRCA.activate_khri?(false, "Vanish")
-      $HUNTING_BUDDY.stop_hunting
-      $COMBAT_TRAINER.stop
-    elsif @safety_exit_on_bleeding && (bleeding? || (stunned? && DRStats.health < (@safety_escape_health_threshold || 80)))
-      echo("Bleeding. Stopping hunt.") if bleeding?
-      echo("Stunned with low health. Stopping hunt.") if stunned?
-      $HUNTING_BUDDY.stop_hunting
-      $COMBAT_TRAINER.stop
-    # If no heal-over-time spells are active then attempt to tend bleeders using ;tendme
-    elsif bleeding? && !Script.running?('tendme') && !(DRSpells.active_spells['Devour'] || DRSpells.active_spells['Heal'] || DRSpells.active_spells['Regenerate'])
-      echo('Checking for tendable bleeders...') if $debug_mode_ct
-      DRC.wait_for_script_to_complete('tendme') if DRCH.has_tendable_bleeders?
-      # Only count a failed attempt if still bleeding afterwards, and reset once
-      # bleeding clears so separate, fully-tended episodes earlier in the hunt do
-      # not accumulate toward the stop threshold.
-      if bleeding?
-        @untendable_counter += 1
-      else
-        @untendable_counter = 0
+    # Once a stop has been decided the combat loop runs a multi-tick cleanup; skip the
+    # bail-out chain during it so we do not re-echo, re-stop, or (for thieves) re-Vanish on
+    # every cleanup tick. The housekeeping below still runs.
+    unless game_state.cleaning_up?
+      # Vanish is a Thief escape (it hides, not merely halts), so for a thief it outranks the
+      # plain concentration/bleed/stun stops -- someone in danger should get out, not just stop.
+      # should_vanish? already requires an escape-worthy state (bleeding/stunned/low health),
+      # so a thief who is merely low on concentration still falls through to the halt below.
+      if should_vanish?
+        vanish_and_stop
+      elsif concentration_too_low?
+        stop_hunt("Concentration below #{@safety_concentration_minimum}. Stopping hunt.")
+      # safety_exit_on_bleeding additionally exits when stunned at low health. That is a
+      # stun escape, not a bleed, so it stays separate from the shared bleed handling below.
+      elsif stunned_at_low_health?
+        stop_hunt("Stunned with low health. Stopping hunt.")
+      # Shared bleed handling for BOTH stop_hunting_if_bleeding and safety_exit_on_bleeding.
+      # The bug: stop_hunting_if_bleeding was gated behind an unreliable tend-failure counter
+      # and effectively never stopped the hunt. A heal-over-time spell tends the bleed for us
+      # (see bleeding_stop_reason), so bleeding alone stops the hunt only when no such spell is
+      # active or vitality has fallen below the floor it can no longer keep up with.
+      elsif (reason = bleeding_stop_reason)
+        stop_hunt(reason)
+      # No stop warranted: if no heal-over-time is tending the bleed, tend it via ;tendme.
+      elsif tend_bleeders?
+        echo('Checking for tendable bleeders...') if $debug_mode_ct
+        DRC.wait_for_script_to_complete('tendme') if DRCH.has_tendable_bleeders?
       end
     end
 
@@ -1330,6 +1547,83 @@ class SafetyProcess
   end
 
   private
+
+  # A heal-over-time spell tends bleeders on its own, so both the bleed-stop gate and
+  # the ;tendme fallback key off the same set. Kept in one place so the call sites
+  # cannot silently diverge.
+  def heal_over_time_active?
+    DRSpells.active_spells['Devour'] || DRSpells.active_spells['Heal'] || DRSpells.active_spells['Regenerate']
+  end
+
+  # stop_hunting_if_bleeding, or the deprecated safety_exit_on_bleeding, enables the shared
+  # bleed handling; the heal-over-time grace and vitality floor then apply identically.
+  def bleed_stop_enabled?
+    @stop_on_bleeding || @safety_exit_on_bleeding
+  end
+
+  # Vitality floor below which a heal-over-time is assumed to no longer keep up; also the
+  # stunned-exit floor. Defaults to 80 when safety_escape_health_threshold is unset.
+  def safety_escape_health_floor
+    @safety_escape_health_threshold || 80
+  end
+
+  # --- bail-out decision and actions (see #execute) ---
+
+  # Stop both the parent hunt loop (if any) and combat-trainer itself. Pass the reason to
+  # log; omit it when the caller has already echoed (e.g. the multi-line Vanish path).
+  def stop_hunt(message = nil)
+    echo(message) if message
+    $HUNTING_BUDDY&.stop_hunting
+    $COMBAT_TRAINER.stop
+  end
+
+  def concentration_too_low?
+    @safety_concentration_minimum && DRStats.concentration < @safety_concentration_minimum
+  end
+
+  def should_vanish?
+    @safety_escape_health_threshold && DRStats.thief? && DRSpells.known_spells['Vanish'] &&
+      (bleeding? || stunned? || DRStats.health < @safety_escape_health_threshold)
+  end
+
+  def vanish_and_stop
+    # Vanish (a khri) can't be used while stunned, so announce the wait up front (the old
+    # "Stunned. Activating Vanish" echo fired after the pause, when stunned? was already
+    # false, so it never actually printed), then wait out the stun before vanishing.
+    echo("Stunned. Waiting for it to clear, then activating Vanish and stopping hunt.") if stunned?
+    pause 0.1 while stunned?
+    echo("Bleeding. Activating Vanish and stopping hunt.") if bleeding?
+    echo("Health below #{@safety_escape_health_threshold}. Activating Vanish and stopping hunt.") if DRStats.health < @safety_escape_health_threshold
+    DRCA.activate_khri?(false, "Vanish")
+    stop_hunt
+  end
+
+  # safety_exit_when_stunned (or the deprecated safety_exit_on_bleeding) stops the hunt when
+  # stunned at low vitality -- a stun escape, independent of bleeding.
+  def stunned_at_low_health?
+    (@safety_exit_when_stunned || @safety_exit_on_bleeding) && stunned? && DRStats.health < safety_escape_health_floor
+  end
+
+  # The stop reason (message) when a bleed should stop the hunt, else nil. A bleed stops the
+  # hunt only if a bleed-stop setting is on AND either no heal-over-time is tending it, or
+  # vitality has dropped below the floor the HoT can no longer keep up with. Returning the
+  # message rather than a bool computes heal_over_time_active? once and keeps the decision
+  # and the wording in lockstep.
+  def bleeding_stop_reason
+    return nil unless bleed_stop_enabled? && bleeding?
+
+    if heal_over_time_active?
+      return nil unless DRStats.health < safety_escape_health_floor
+
+      "Bleeding with vitality below #{safety_escape_health_floor} despite an active heal-over-time. Stopping hunt."
+    else
+      "Bleeding. Stopping hunt."
+    end
+  end
+
+  def tend_bleeders?
+    bleeding? && !Script.running?('tendme') && !heal_over_time_active?
+  end
 
   def check_item_recovery(game_state)
     if Flags['ct-germshieldlost']
@@ -1588,6 +1882,7 @@ class SpellProcess
     Flags.add('ct-regalia-expired', 'Your .* glimmers? weakly') if DRStats.trader?
     Flags.add('ct-regalia-succeeded', 'You cup your palms skyward to bask in') if DRStats.trader?
     Flags.add('ct-shock-warning', 'You are distinctly aware that completion of this spell pattern may bring you shock')
+    Flags.add('ct-spell-unknown', 'You have no idea how to cast that spell')
 
     @offensive_spells
       .select { |spell| spell['expire'] }
@@ -1607,6 +1902,14 @@ class SpellProcess
     @tk_spell = @offensive_spells.find { |spell| spell['abbrev'] =~ /tkt|tks/i }
     drop_tkt_ammo
     Flags.add('need-tkt-ammo', 'There is nothing here that can be thrown')
+
+    # Minimum seconds between recreating telekinetic slivers (see #check_slivers).
+    # Without a throttle, slivers are remade the instant they deplete, which can
+    # spam Moonblade casts on targets that consume slivers quickly. Default 180s;
+    # set sliver_recast_delay: 0 in your yaml to disable the throttle entirely.
+    @sliver_recast_delay = settings.sliver_recast_delay || 180
+    # Seed so the first check may create slivers immediately.
+    @sliver_timer = Time.now - @sliver_recast_delay
 
     @spell_checks = []
     @spell_checks << :check_slivers if DRStats.moon_mage? && @tk_spell&.dig('slivers')
@@ -1719,11 +2022,19 @@ class SpellProcess
     return unless @tk_spell&.dig('slivers')
     return if game_state.casting
     return if DRSpells.slivers
+    # Throttle sliver re-creation so a fast-depleting target (or a run of failed
+    # casts) can't re-enter and spam Moonblade every tick. sliver_recast_delay
+    # defaults to 180s and is user-configurable (0 disables the throttle).
+    return if Time.now - @sliver_timer < @sliver_recast_delay
 
     unless UserVars.moons['visible'].any?
       DRC.message "There are NO moons available and you have NO TK_AMMO set! You need to fix this!" if !@tk_ammo && $debug_mode_ct
       return
     end
+
+    # We are committing to an attempt: start the cooldown now so that whether the
+    # casts succeed or all fail, we won't try again until the delay elapses.
+    @sliver_timer = Time.now
 
     # With low skill you may fail to create the slivers
     # when breaking your moonblade. If so, keep retrying.
@@ -1744,15 +2055,21 @@ class SpellProcess
       if retry_count == 0
         lunar_magic_rank = DRSkill.getrank('Lunar Magic')
         if lunar_magic_rank >= 400
-          moonblade_spell['prep_time'] = 1
-        elsif lunar_magic_rank >= 300
           moonblade_spell['prep_time'] = 2
-        elsif lunar_magic_rank >= 200
+        elsif lunar_magic_rank >= 300
           moonblade_spell['prep_time'] = 3
+        elsif lunar_magic_rank >= 200
+          moonblade_spell['prep_time'] = 4
         end
       end
-      DRCA.cast_spell(moonblade_spell, @settings)
-      created_slivers = DRC.bput("break moonblade", "The slivers drift about", "dissipate without any benefit", "Break what?") == "The slivers drift about"
+      # Only break a moonblade we actually just summoned. If this cast fails
+      # (e.g. a snap-cast at minimum prep the character lacks the skill to
+      # complete), a bare "break moonblade" would shatter the moonblade already
+      # in hand -- the wielded weapon of a moonblade melee trainer -- leaving
+      # the character unarmed. Guard the break on the cast succeeding.
+      if DRCA.cast_spell(moonblade_spell, @settings)
+        created_slivers = DRC.bput("break moonblade", "The slivers drift about", "dissipate without any benefit", "Break what?") == "The slivers drift about"
+      end
       retry_count = retry_count + 1
     end
     DRC.message("Failed to create slivers for telekinetic ammo after #{retry_count} attempts") unless created_slivers
@@ -1779,12 +2096,46 @@ class SpellProcess
   def check_timer(game_state)
     return if game_state.cast_timer.nil? || (Time.now - game_state.cast_timer) <= 70
 
-    game_state.cast_timer = nil
     if game_state.casting
       DRC.bput('release spell', 'You let your concentration lapse', "You aren't preparing a spell")
       DRC.bput('release mana', 'You release all', "You aren't harnessing any mana")
     end
+    reset_casting_state(game_state)
+  end
+
+  # Clear the casting flags/ivars WITHOUT the success-path side-effects (weapon
+  # restore, moon-weapon re-wear, blacklist, command send) that cast_spell runs.
+  # Used by the two non-casting exits -- an aborted prep and the 70s check_timer
+  # recovery -- so stale casting_* sub-flags don't bleed into the next cast.
+  def reset_casting_state(game_state)
     game_state.casting = false
+    game_state.cast_timer = nil
+    game_state.hide_on_cast = false
+    game_state.casting_weapon_buff = false
+    game_state.casting_consume = false
+    game_state.casting_nr = false
+    game_state.casting_cfb = false
+    game_state.casting_cfw = false
+    game_state.casting_cyclic = false
+    game_state.casting_sorcery = false
+    game_state.casting_moonblade = false
+    game_state.casting_regalia = false
+    @custom_cast = nil
+    @symbiosis = nil
+    @barrage = nil
+    @before = nil
+    @after = nil
+    @skill = nil
+    @abbrev = nil
+    @use_auto_mana = nil
+    @prepared_spell = nil
+    # Clear the cambrinth invoke/harness intent for this (now-abandoned) cast.
+    # The cambrinth itself stays charged on the game side -- charges never leak --
+    # so a later cast can still use them; we just must not carry a stale invoke
+    # decision into the next spell, or check_current would wait on check_charging?
+    # for a spell that isn't using cambrinth.
+    @should_invoke = nil
+    @should_harness = false
   end
 
   def check_avtalia(game_state)
@@ -1901,7 +2252,7 @@ class SpellProcess
     DRC.hide?(@hide_type) if game_state.hide_on_cast && game_state.use_stealth?
 
     if game_state.casting_sorcery
-      @equipment_manager.stow_weapon(game_state.weapon_name)
+      game_state.stow_or_store_weapon
     end
 
     if game_state.casting_regalia
@@ -1963,7 +2314,11 @@ class SpellProcess
 
     if game_state.casting_sorcery
       game_state.casting_sorcery = false
-      @equipment_manager.wield_weapon?(game_state.weapon_name, game_state.weapon_skill)
+      # Summoned-weapon-aware re-wield: a sorcery-boosted cast stows the weapon
+      # first, and a raw wield_weapon? can never match a summoned moonblade /
+      # elemental weapon (spurious "Failed to match a weapon"). restore_weapon
+      # re-holds and reshapes a summoned weapon, or normally wields a gear one.
+      game_state.restore_weapon
     end
 
     if game_state.casting_moonblade
@@ -2016,6 +2371,7 @@ class SpellProcess
     needs_training = ['Warding', 'Utility', 'Augmentation', 'Sorcery', 'Debilitation', 'Targeted Magic'].select do |skill|
       data = @training_spells[skill]
       next false unless data
+      next false if spell_disabled?(data['abbrev'])
       next false unless game_state.is_offense_allowed? || data['harmless']
       next false unless %w[Warding Utility Augmentation].include?(skill) || (!@training_spells_combat_sorcery && skill == 'Sorcery') || !game_state.npcs.empty?
       next false unless DRSkill.getxp(skill) < @magic_exp_training_max_threshold
@@ -2076,11 +2432,33 @@ class SpellProcess
     DRCI.put_away_item?(data['runestone_name'], @runestone_storage)
   end
 
+  # Spells the game reports the character cannot cast ("You have no idea how to
+  # cast that spell") are disabled by abbrev so they are not retried every tick.
+  # Keyed by abbrev, not by a flag on the spell hash, because some callers
+  # (empath healing) rebuild the hash each tick, so a flag on it would not
+  # persist. See issue #7563.
+  def spell_disabled?(abbrev)
+    !!(abbrev && @disabled_spells&.include?(abbrev.downcase))
+  end
+
+  def disable_spell(data)
+    abbrev = data['abbrev']
+    return unless abbrev
+
+    @disabled_spells ||= Set.new
+    # add? returns nil when already present, so the message prints exactly once
+    # per run; the disable is cleared the next time combat-trainer is started.
+    return unless @disabled_spells.add?(abbrev.downcase)
+
+    DRC.message("Disabling #{data['name'] || abbrev} for this session: the game reports you have no idea how to cast it. Re-memorize it (or fix your spell lists) and restart combat-trainer to re-enable.")
+  end
+
   def check_buffs(game_state)
     return if game_state.casting
     return if DRStats.mana < @buff_spell_mana_threshold
 
     recastable_buffs = @buff_spells.select do |name, data|
+      next false if spell_disabled?(data['abbrev'])
       next false unless data['recast'] || data['recast_every'] || data['expire']
       next false if data['expire'] && !Flags["ct-#{data['abbrev']}"]
       next false unless check_buff_conditions?(name, game_state)
@@ -2146,7 +2524,7 @@ class SpellProcess
   def check_health_empath(game_state)
     return if DRStats.health > @empath_vitality_threshold && @wounds.empty?
 
-    if DRSpells.active_spells['Regeneration']
+    if DRSpells.active_spells['Regenerate']
       if @empath_spells['VH'] && DRStats.health <= @empath_vitality_threshold
         data = { 'abbrev' => 'vh', 'mana' => @empath_spells['VH'].first, 'cambrinth' => @empath_spells['VH'][1..-1], 'harmless' => true }
         prepare_spell(data, game_state)
@@ -2161,9 +2539,9 @@ class SpellProcess
 
     echo('Healing') if $debug_mode_ct
     if @wounds.any?
-      if @empath_spells['FOC']
+      if @empath_spells['FOC'] && !spell_disabled?('foc')
         data = { 'abbrev' => 'foc', 'mana' => @empath_spells['FOC'].first, 'cambrinth' => @empath_spells['FOC'][1..-1], 'harmless' => true }
-      elsif @empath_spells['HEAL']
+      elsif @empath_spells['HEAL'] && !spell_disabled?('heal')
         data = { 'abbrev' => 'heal', 'mana' => @empath_spells['HEAL'].first, 'cambrinth' => @empath_spells['HEAL'][1..-1], 'harmless' => true }
       end
       @wounds = {}
@@ -2322,7 +2700,8 @@ class SpellProcess
 
     echo "Figuring out ready offensive spells..." if $debug_mode_ct
     ready_spells = @offensive_spells.select do |spell|
-      next false if spell['target_enemy'] && !game_state.npcs.include?(spell['target_enemy'])
+      next false if spell_disabled?(spell['abbrev'])
+      next false if spell['target_enemy'] && Lich::DragonRealms::Creature.targets.none? { |c| c.noun == spell['target_enemy'] }
       next false if spell['min_threshold'] && game_state.npcs.length < spell['min_threshold']
       next false if spell['max_threshold'] && game_state.npcs.length > spell['max_threshold']
       next false if spell['expire'] && !Flags["ct-#{spell['abbrev']}"]
@@ -2382,11 +2761,10 @@ class SpellProcess
   end
 
   def cast_ritual(data, game_state)
-    if (summoned = game_state.summoned_info(game_state.weapon_skill))
-      DRCS.break_summoned_weapon(game_state.weapon_name)
-    else
-      @equipment_manager.stow_weapon(game_state.weapon_name)
-    end
+    # Centralized summoned-aware disposition: a moon mage's blade is worn (not
+    # broken) so restore_weapon can re-hold it; warrior-mage / gear weapons are
+    # broken / stowed and re-summoned / re-wielded exactly as before.
+    game_state.stow_or_store_weapon
 
     data = DRCMM.update_astral_data(data, @settings)
     if data # DRCMM.update_astral_data returns nil on failure
@@ -2394,16 +2772,24 @@ class SpellProcess
       DRCA.ritual(data, @settings)
     end
 
-    if summoned
-      game_state.prepare_summoned_weapon(false)
-    else
-      @equipment_manager.wield_weapon?(game_state.weapon_name, game_state.weapon_skill)
-    end
+    game_state.restore_weapon
     game_state.reset_stance = true
   end
 
   def prepare_spell(data, game_state, force_cambrinth = false)
     return unless data
+    # Central guard: a spell the game said we cannot cast is skipped here, so every
+    # caller (offensive/buff/training selects, empath/necro healing, regalia, ...)
+    # is covered and none re-send `prep` or trip destructive prep side-effects
+    # (release_cyclics, drop_moon_weapon?) below. See issue #7563.
+    # reset_casting_state clears any casting_* sub-flag a caller set before calling
+    # us -- check_cfb/check_cfw/heal_corpse/check_consume set casting_cfb/cfw/nr/
+    # consume before prepare_spell -- otherwise necro_casting? would stay true after
+    # a disabled necro spell and suppress looting, rituals, and pet creation.
+    if spell_disabled?(data['abbrev'])
+      reset_casting_state(game_state)
+      return
+    end
 
     data = DRCA.check_discern(data, @settings, spell_is_sorcery?(data)) if data['use_auto_mana']
     game_state.cast_timer = Time.now
@@ -2411,7 +2797,8 @@ class SpellProcess
     echo("prepare spell: #{data}") if $debug_mode_ct
     if data['target_enemy']
       echo("  Target found: #{data['target_enemy']}") if $debug_mode_ct
-      fput("face #{data['target_enemy']}")
+      se_target = Lich::DragonRealms::Creature.targets.find { |c| c.noun == data['target_enemy'] }
+      fput(se_target ? "face ##{se_target.id}" : "face #{data['target_enemy']}")
     end
 
     command = 'prep'
@@ -2477,8 +2864,25 @@ class SpellProcess
     game_state.casting_regalia = data['abbrev'].casecmp('REGAL').zero?
 
     Flags.reset('ct-shock-warning')
+    Flags.reset('ct-spell-unknown')
     custom_prep = data['custom_prep'] || @settings['custom_spell_prep']
-    DRCA.prepare?(data['abbrev'], data['mana'], data['symbiosis'], command, data['tattoo_tm'], data['runestone_name'], data['runestone_tm'], custom_prep)
+    prepared = DRCA.prepare?(data['abbrev'], data['mana'], data['symbiosis'], command, data['tattoo_tm'], data['runestone_name'], data['runestone_tm'], custom_prep)
+
+    # The character does not know this spell (e.g. a scroll-memorized spell lost on
+    # death, or an Analogous Patterns spell forgotten at circle 10). Disable it so we
+    # do not retry it every tick; the check_* paths below skip disabled spells.
+    disable_spell(data) if Flags['ct-spell-unknown']
+    Flags.reset('ct-spell-unknown')
+
+    # Preparation failed (unknown spell, area interference, exhausted retries, etc.).
+    # Do NOT set casting; otherwise execute() bails on `if game_state.casting` and
+    # starves all offensive and training casting until check_timer clears it 70s later.
+    # reset_casting_state also clears the casting_* sub-flags set above (cyclic,
+    # moonblade, regalia) and by callers (sorcery, weapon_buff, hide_on_cast).
+    unless prepared
+      reset_casting_state(game_state)
+      return
+    end
 
     if Flags['ct-shock-warning'] && !game_state.is_permashocked?
       DRC.message('Dropping spell: Got shock warning.')
@@ -2774,8 +3178,8 @@ class AbilityProcess
   # @param ordinal [String] the ordinal noun to get (e.g. "egg", "second egg")
   # @return [void]
   def discover_egg(ordinal)
-    if DRCI.get_item?(ordinal)
-      id = GameObj.right_hand.id
+    id = id_taken_into_hand(ordinal, known: @egg_ids) { DRCI.get_item?(ordinal) }
+    if id
       @egg_ids << id
       echo "Discovered #{ordinal} ##{id}" if $debug_mode_ct
       DRCI.stow_item?("##{id}")
@@ -2789,13 +3193,12 @@ class AbilityProcess
   # @param noun [String] the warhorn noun to find (e.g. "warhorn", "horn")
   # @return [void]
   def discover_warhorn(noun)
-    if DRCI.remove_item?(noun)
-      id = GameObj.right_hand.id
+    known = @warhorn_items.map { |item| item[:id] }
+    if (id = id_taken_into_hand(noun, known: known) { DRCI.remove_item?(noun) })
       @warhorn_items << { id: id, worn: true }
       echo "Discovered warhorn '#{noun}' ##{id} (worn)" if $debug_mode_ct
       DRCI.wear_item?("##{id}")
-    elsif DRCI.get_item?(noun)
-      id = GameObj.right_hand.id
+    elsif (id = id_taken_into_hand(noun, known: known) { DRCI.get_item?(noun) })
       @warhorn_items << { id: id, worn: false }
       echo "Discovered warhorn '#{noun}' ##{id} (stowed)" if $debug_mode_ct
       DRCI.stow_item?("##{id}")
@@ -2804,30 +3207,106 @@ class AbilityProcess
     end
   end
 
-  # Rotates through egg and warhorn types, using whichever is off cooldown.
-  # The 10-minute room effect gate prevents wasted attempts.
-  # @param game_state [GameState] current combat game state
+  # Runs a get/remove and returns the game ID of the item it put in a hand.
+  #
+  # The game puts the item in whichever hand is free -- the left one when the
+  # right is already full -- so the right hand cannot be assumed. Doing so
+  # recorded whatever the right hand held (e.g. a traveler's pack) as the egg,
+  # and every later INVOKE of that ID timed out. Instead the item is the hand
+  # whose noun starts with the expected noun, the way the game matches a noun
+  # ("warhorn" or "warh" find a "mammoth-tusk warhorn"; "horn" never does).
+  # That also covers "You are already holding that". IDs already
+  # discovered are skipped: DRCI.get_item? reports success whenever an egg is
+  # in hand, so a failed "get my second egg" would otherwise find the first egg
+  # again. No wait is needed: the game sends the hand update before the
+  # confirmation text (a raw capture of "get my egg" had <right exist=...> 70
+  # lines ahead of "You get ..."), and Lich applies each line's XML before
+  # scripts see later lines, so the hands are current when the get/remove
+  # returns.
+  #
+  # @param name [String] the item name used for the get/remove (e.g. "egg",
+  #   "second egg", "warhorn", "warh"); its noun is matched against the start
+  #   of each hand's noun
+  # @param known [Array<String>] game IDs already discovered, never returned
+  # @yieldreturn [Boolean] whether the get/remove succeeded
+  # @return [String, nil] the item's game ID, or nil if the command failed or
+  #   no undiscovered item with that noun is in hand
+  def id_taken_into_hand(name, known: [])
+    return nil unless yield
+
+    noun = DRC.get_noun(name.to_s).to_s.downcase
+    hand = [GameObj.right_hand, GameObj.left_hand].find do |held|
+      held.id && !known.include?(held.id) && held.noun.to_s.downcase.start_with?(noun)
+    end
+    hand&.id
+  end
+
+  # Rotate through the configured egg/warhorn types and, if the room effect is
+  # off cooldown, apply whichever type is next in the rotation.
+  #
+  # This governs only the *room effect* -- the shared, room-scoped buff a warhorn
+  # or egg lays down. The physical item recharge cooldown is enforced separately
+  # inside {use_egg?} and {use_warhorn?}. The cooldown decision is delegated to
+  # {room_effect_on_cooldown?} so a plugin may substitute shared, cross-character
+  # bookkeeping (see the plugin system on {CombatTrainer}).
+  #
+  # @param game_state [GameState] current combat game state (warhorns use it to
+  #   sheathe/wield an offhand around the exhale).
   # @return [void]
   def use_warhorn_or_egg(game_state)
+    room_id = Room.current.id
     DRC.message("Time since last room effect: #{(Time.now - UserVars.warhorn["last_warhorn_or_egg"]) / 60} min") if $debug_mode_ct
 
-    return unless Time.now > (UserVars.warhorn["last_warhorn_or_egg"] + 600)
+    return if room_effect_on_cooldown?(room_id)
 
     type = @warhorn_or_egg[0]
+    used =
+      case type
+      when 'egg' then use_egg?
+      when 'warhorn' then use_warhorn?(game_state)
+      else false
+      end
 
-    if type == 'egg'
-      if use_egg?
-        DRC.message("SUCCESSFUL egg use") if $debug_mode_ct
-        UserVars.warhorn["last_warhorn_or_egg"] = Time.now
-      end
-    elsif type == 'warhorn'
-      if use_warhorn?(game_state)
-        DRC.message("SUCCESSFUL horn use") if $debug_mode_ct
-        UserVars.warhorn["last_warhorn_or_egg"] = Time.now
-      end
+    if used
+      DRC.message("SUCCESSFUL #{type} use") if $debug_mode_ct
+      record_room_effect(room_id, type)
     end
 
     @warhorn_or_egg.rotate!
+  end
+
+  # Decide whether the current room's warhorn/egg effect is still active, in
+  # which case a fresh application should be skipped.
+  #
+  # A registered plugin may answer the +:warhorn_cooldown_active?+ decision hook
+  # to supply shared/room-scoped state (e.g. a cross-character store); any
+  # non-nil answer overrides the built-in check. When no plugin answers, the
+  # historical per-character timer in +UserVars.warhorn+ is used, preserving
+  # legacy behavior exactly (a 600-second gate).
+  #
+  # @param room_id [Integer, nil] the current room id, forwarded to plugins.
+  # @return [Boolean] +true+ if the effect is still on cooldown (skip use),
+  #   +false+ if it is safe to apply the effect now.
+  def room_effect_on_cooldown?(room_id)
+    override = CombatTrainer.fire_hook(:warhorn_cooldown_active?, room_id: room_id)
+    return override unless override.nil?
+
+    Time.now <= (UserVars.warhorn["last_warhorn_or_egg"] + 600)
+  end
+
+  # Record that the room effect was just (re)applied.
+  #
+  # The built-in per-character timer is always refreshed so combat-trainer's
+  # default cooldown stays consistent even when a plugin overrode the decision.
+  # The +:warhorn_applied+ notification hook then lets plugins persist the event
+  # to their own store, keyed by +room_id+.
+  #
+  # @param room_id [Integer, nil] the room the effect was applied in.
+  # @param type [String] the effect source, +"egg"+ or +"warhorn"+.
+  # @return [void]
+  def record_room_effect(room_id, type)
+    UserVars.warhorn["last_warhorn_or_egg"] = Time.now
+    CombatTrainer.notify_hook(:warhorn_applied, room_id: room_id, type: type)
   end
 
   # Iterates through discovered eggs, skipping those on cooldown, and invokes
@@ -3079,7 +3558,7 @@ class AbilityProcess
     Flags.reset('ct-battle-cry-not-facing')
 
     battle_cries = @battle_cries
-                   .select { |battle_cry| battle_cry['target_enemy'] ? game_state.npcs.include?(battle_cry['target_enemy']) : true }
+                   .select { |battle_cry| battle_cry['target_enemy'] ? Lich::DragonRealms::Creature.targets.any? { |c| c.noun == battle_cry['target_enemy'] } : true }
                    .select { |battle_cry| battle_cry['min_threshold'] ? game_state.npcs.length >= battle_cry['min_threshold'] : true }
                    .select { |battle_cry| battle_cry['max_threshold'] ? game_state.npcs.length <= battle_cry['max_threshold'] : true }
 
@@ -3094,7 +3573,10 @@ class AbilityProcess
       echo "Using roar helm: #{@roar_helm_noun}" if @roar_helm_noun && $debug_mode_ct
 
       command = battle_cry_data['command']
-      command = (command + " at " + battle_cry_data['target_enemy']) if battle_cry_data['target_enemy']
+      if battle_cry_data['target_enemy']
+        bc_target = Lich::DragonRealms::Creature.targets.find { |c| c.noun == battle_cry_data['target_enemy'] }
+        command += " at " + (bc_target ? "##{bc_target.id}" : battle_cry_data['target_enemy'])
+      end
 
       # Use roar helm if specified
       fput("scream #{@roar_helm_noun}") if @roar_helm_noun
@@ -3132,6 +3614,9 @@ class ManipulateProcess
     @manip_to_train = settings.manipulate_only_to_train
     echo("  @manip_to_train: #{@manip_to_train}") if $debug_mode_ct
 
+    @ignored_npcs = settings.ignored_npcs || []
+    echo("  @ignored_npcs: #{@ignored_npcs}") if $debug_mode_ct
+
     @last_manip = Time.now - 200
   end
 
@@ -3139,41 +3624,49 @@ class ManipulateProcess
     waitrt?
     return if game_state.danger || @threshold.nil? || game_state.construct_mode?
 
-    @filtered_npcs = game_state.npcs
+    @targets = manipulable_targets
     manipulate(game_state) if should_manipulate?
   end
 
   private
 
+  # Live, hostile creatures we may manipulate this tick, keyed by stable
+  # <crtrStatus> id, minus the ignore list. Constructs are still counted here
+  # (matching the pre-migration threshold, which read the hostility-agnostic
+  # game_state.npcs) but skipped in #manipulate below.
+  def manipulable_targets
+    Lich::DragonRealms::Creature.targets.reject do |creature|
+      creature.noun && @ignored_npcs.include?(creature.noun)
+    end
+  end
+
   def should_manipulate?
     return false if @manip_to_train && DRSkill.getxp('Empathy') > 30
 
-    @filtered_npcs.length >= @threshold && Time.now - @last_manip > 120
+    @targets.length >= @threshold && Time.now - @last_manip > 120
   end
 
   def manipulate(game_state)
     DRC.bput('manipulate stop all', /^You relax your will/, /^But you aren't manipulating anything/)
 
     manipulate_count = 0
-    npc_occurrences = Hash.new(0)
 
-    @filtered_npcs.each do |npc|
-      next if game_state.construct?(npc)
+    @targets.each do |creature|
+      next if creature.noun && game_state.construct?(creature.noun)
       break if manipulate_count >= @threshold
 
-      index = npc_occurrences[npc]
-      ordinal_string = $ORDINALS[index]
-
-      case DRC.bput("manipulate friendship #{ordinal_string} #{npc}", 'You\'re already manipulating', 'beyond your ken', 'You attempt to empathically manipulate', 'You strain', 'does not seem to have a life essence', 'Manipulate what', 'deep sense of loss')
+      # Target the specific creature by its stable <crtrStatus> id, so duplicate
+      # same-noun mobs no longer need ordinal disambiguation (a construct check
+      # by noun still applies; the noun may be nil during the name-less window).
+      case DRC.bput("manipulate friendship ##{creature.id}", 'You\'re already manipulating', 'beyond your ken', 'You attempt to empathically manipulate', 'You strain', 'does not seem to have a life essence', 'Manipulate what', 'deep sense of loss')
       when 'does not seem to have a life essence' then
-        game_state.construct(npc)
+        game_state.construct(creature.noun) if creature.noun
       when 'deep sense of loss'
         DRC.message("***WARNING*** Too shocked to manipulate -- disabling manipulation for this hunt")
         @threshold = nil
         break
       else
         manipulate_count += 1
-        npc_occurrences[npc] += 1
       end
     end
 
@@ -3297,6 +3790,9 @@ class TrainerProcess
     @combat_trainer_herbs_allowhands = settings.combat_trainer_herbs_allowhands
     echo("  @combat_trainer_herbs_allowhands: #{@combat_trainer_herbs_allowhands}") if $debug_mode_ct
 
+    @combat_trainer_use_remedies = settings.combat_trainer_use_remedies
+    echo("  @combat_trainer_use_remedies: #{@combat_trainer_use_remedies}") if $debug_mode_ct
+
     @telescope_storage = settings.telescope_storage
     echo("  @telescope_storage: #{@telescope_storage}") if $debug_mode_ct
 
@@ -3394,6 +3890,13 @@ class TrainerProcess
       end
     when /^Stealth$/i
       hide_action(game_state)
+    when /^Confidence$/i
+      if DRStats.guild == 'Thief'
+        hide_action(game_state)
+      else
+        DRC.message("Confidence is only for thieves, removing from training_abilities.")
+        @training_abilities.delete('Confidence')
+      end
     when /^(Ret|Retreat) Stealth$/i
       DRC.retreat
       hide_action(game_state)
@@ -3413,7 +3916,8 @@ class TrainerProcess
     when /^PrayerMat$/i
       pray_mat(game_state)
     when /^Recall$/i
-      DRC.bput("recall #{game_state.npcs.first}", 'Roundtime', 'You are far too occupied', 'You search your mind') unless game_state.npcs.empty?
+      recall_target = Lich::DragonRealms::Creature.targets.first
+      DRC.bput("recall ##{recall_target.id}", 'Roundtime', 'You are far too occupied', 'You search your mind') if recall_target
     when /^Barb Research Augmentation$/i
       DRC.bput('meditate research monkey', /^You clear your mind and begin to meditate/, /^What did you want to research/)
     when /^Barb Research Warding$/i
@@ -3442,12 +3946,14 @@ class TrainerProcess
     when /^Smite$/i
       smite(game_state)
     when /^Herbs$/i
+      remedy_args = ['quick']
+      remedy_args << 'override' if @combat_trainer_use_remedies
       if game_state.npcs.empty? || @combat_trainer_herbs_allowhands
         game_state.sheath_whirlwind_offhand
-        DRC.wait_for_script_to_complete('heal-remedy', ['quick'])
+        DRC.wait_for_script_to_complete('heal-remedy', remedy_args)
         game_state.wield_whirlwind_offhand
       else
-        DRC.wait_for_script_to_complete('heal-remedy', %w[quick nohands])
+        DRC.wait_for_script_to_complete('heal-remedy', remedy_args + ['nohands'])
       end
     when /^Tessera$/i
       invest_in_tessera(game_state)
@@ -3459,8 +3965,6 @@ class TrainerProcess
   private
 
   def hide_action(game_state)
-    return if DRSkill.getxp('Stealth') >= 34
-
     if DRC.hide?(@hide_type) && !@dont_stalk && !game_state.npcs.empty? && @hide_type == 'hide'
       stalked = ['You move into position', 'already stalking'].include?(
         DRC.bput('stalk', 'Stalk what',
@@ -3542,7 +4046,8 @@ class TrainerProcess
   end
 
   def meraud_commune(game_state)
-    unless (DRSkill.getrank('Theurgy') >= 300 || game_state.npcs.empty?) && !game_state.aimed_skill?
+    # Training an aimed weapon skill uses a different stow/wield flow, so skip.
+    if game_state.aimed_skill?
       reset_ability(game_state, 'Meraud')
       return
     end
@@ -3552,6 +4057,14 @@ class TrainerProcess
       return
     end
     waitrt?
+    # The commune is a lengthy, vulnerable ritual (stow weapon, sprinkle holy
+    # water, wave incense, then a ~7s commune). Requiring an empty room meant a
+    # sub-300 Theurgy character almost never got to run it during a hunt, since
+    # the room rarely clears. Retreat out of melee first instead -- the same way
+    # #pray_mat does -- so it can fire mid-hunt. AbilityProcess#execute already
+    # bails when game_state.danger is set, and the 3900s cooldown means this
+    # retreat happens at most once per hunt.
+    DRC.retreat unless game_state.npcs.empty?
     @equipment_manager.stow_weapon(game_state.weapon_name)
     unless DRCTH.sprinkle_holy_water?(@theurgy_supply_container, @water_holder, checkname) && DRCTH.wave_incense?(@theurgy_supply_container, @flint_lighter, checkname)
       DRC.message("Holy water sprinkling, or incense waving routine failed, skipping Meraud commune")
@@ -3687,14 +4200,13 @@ class TrainerProcess
 
   def appraise(game_state, modifier)
     return if game_state.retreating?
-    return if game_state.npcs.empty?
 
-    target = (game_state.npcs - @no_app).first
+    target = Lich::DragonRealms::Creature.targets.find { |c| !@no_app.include?(c.id) }
     return unless target
     return if DRSkill.getrank('Appraisal') < 76
-    return if DRC.bput("app #{target} #{modifier}", 'Taking stock of', 'It\'s dead', 'You can\'t determine anything about this creature.', 'I could not find', 'You cannot appraise that', 'roundtime', '^Perhaps that', 'Appraise what') != 'Perhaps that'
+    return if DRC.bput("app ##{target.id} #{modifier}", 'Taking stock of', 'It\'s dead', 'You can\'t determine anything about this creature.', 'I could not find', 'You cannot appraise that', 'roundtime', '^Perhaps that', 'Appraise what') != 'Perhaps that'
 
-    @no_app << target
+    @no_app << target.id
   end
 
   def moon_mage_perc(game_state)
@@ -3720,13 +4232,16 @@ class TrainerProcess
   end
 
   def check_heavens(game_state)
-    @equipment_manager.stow_weapon(game_state.weapon_name)
+    # Use the summoned-weapon-aware store/restore so a moon mage's moonblade is
+    # WORN out of the hand (freeing it for the telescope) rather than left stuck
+    # in hand by a stow that can never match the summoned name.
+    game_state.stow_or_store_weapon
     if @have_telescope
       determine_time if DRCMM.get_telescope?(@telescope_name, @telescope_storage)
     else
       determine_time
     end
-    @equipment_manager.wield_weapon?(game_state.weapon_name, game_state.weapon_skill)
+    game_state.restore_weapon
   end
 
   def determine_time
@@ -3988,7 +4503,7 @@ class AttackProcess
         end
       end
 
-      DRC.bput(command, 'Wouldn\'t it be better if you used a melee weapon?', 'You need two hands to wield this weapon', 'You turn to face', 'Face What?', 'Roundtime', "You aren't close enough to attack", 'It would help if you were closer', 'There is nothing else to face!', 'You must be hidden', 'flying too high for you to attack', 'You can\'t coldcock', 'while it is flying', 'Novel idea, but it\'s a ghost!', 'Bumbling, you slip', 'You can not slam with that', 'You must be hidden or invisible to ambush', 'You don\'t have enough focus', 'You don\'t think you have enough focus', 'You can\'t backstab that', 'is already out cold')
+      DRC.bput(command, 'Wouldn\'t it be better if you used a melee weapon?', 'You need two hands to wield this weapon', 'You turn to face', 'Face What?', 'Roundtime', "You aren't close enough to attack", 'It would help if you were closer', 'There is nothing else to face!', 'You must be hidden', 'flying too high for you to attack', 'You can\'t coldcock', 'while it is flying', 'Novel idea, but it\'s a ghost!', 'Bumbling, you slip', 'You can not slam with that', 'You must be hidden or invisible to ambush', 'You don\'t have enough focus', 'You don\'t think you have enough focus', 'You can\'t backstab that', 'is already out cold', /^Your.*engulfed by fire as bright as the noontime sun/)
     end
 
     waitrt?
@@ -4022,7 +4537,12 @@ class AttackProcess
   def attack_thrown(game_state)
     attack_action = game_state.thrown_attack_verb
     attack_action += ' left' if game_state.offhand?
-    DRC.bput(attack_action, 'roundtime', 'What are you trying to')
+    # Some thrown hits (e.g. an offhand lob that shatters a limb) resolve without the
+    # game ever printing a 'roundtime' line, which would otherwise stall bput for its
+    # full timeout. Also match the throw's own success text so we return promptly and
+    # let waitrt? handle the actual roundtime from XML. See issue #7529.
+    attack_verb = attack_action.split(' ').first
+    DRC.bput(attack_action, /you #{Regexp.escape(attack_verb)}/i, 'roundtime', 'What are you trying to')
     waitrt?
     return game_state.action_taken if attack_action.include?('whip')
 
@@ -4054,7 +4574,7 @@ class AttackProcess
     when 'What were you'
       # Workaround for a game bug when you lob an unblessed weapon at a noncorporeal mob
       # The weapon lands on the ground, not in the 'at feet' slot, and 'my' will not work
-      DRC.bput("get #{game_state.weapon_name}", 'You pick up', 'You get')
+      DRC.bput("get #{game_state.weapon_name}", 'You pick up', 'You get', 'spins back towards you, returning safely to your outstretched hand')
     when *bonded_invoke_success
       DRC.bput('swap', 'You move', 'You have nothing') if game_state.offhand?
     end
@@ -4423,6 +4943,187 @@ class AttackProcess
 end
 
 class CombatTrainer
+  # ============================================================
+  # PLUGIN SYSTEM
+  # ============================================================
+  # Combat-trainer exposes a small, vendor-neutral plugin system so external
+  # scripts can observe and influence the combat lifecycle without forking this
+  # file. A plugin is any plain Ruby object that implements zero or more *hook
+  # methods*; combat-trainer discovers hooks by name at runtime via +respond_to?+
+  # and never requires a plugin to inherit a base class or satisfy a fixed
+  # interface. This keeps the coupling one-directional (plugins depend on
+  # combat-trainer's hook names, not vice versa) in the spirit of the Dependency
+  # Inversion and Interface Segregation principles.
+  #
+  # == Authoring a plugin
+  #
+  # Create a file named +combat-trainer-plugin-<name>.rb+ in the +custom+
+  # directory (+<SCRIPT_DIR>/custom/+). At boot, combat-trainer loads every
+  # matching file in sorted filename order, *before* the orchestrator is
+  # constructed, and each file is expected to register one instance:
+  #
+  #   CombatTrainer.register_plugin(MyPlugin.new)
+  #
+  # A plugin implements only the hooks it cares about; unimplemented hooks are
+  # skipped. A plugin that raises inside a hook is isolated: the error is
+  # swallowed (and echoed under +$debug_mode_ct+) so a misbehaving plugin
+  # degrades to the built-in default rather than aborting combat.
+  #
+  # == Two dispatch styles
+  #
+  #   * {fire_hook} -- a *decision* hook. Plugins are polled in registration
+  #     order and the first non-nil return value wins, replacing combat-trainer's
+  #     built-in behavior for that decision. A plugin returns +nil+ (or omits the
+  #     hook) to defer to the built-in default. Note that +false+ is a real
+  #     answer and short-circuits the poll.
+  #   * {notify_hook} -- a *notification* hook. Every plugin implementing the
+  #     hook is invoked for its side effects; return values are ignored and an
+  #     exception raised by one plugin never stops the others.
+  #
+  # The registry and both dispatch methods are class-level so that decoupled
+  # combat +*Process+ collaborators (which hold no reference to the orchestrator
+  # instance) can still fire hooks via +CombatTrainer.fire_hook+ /
+  # +CombatTrainer.notify_hook+.
+  #
+  # == Hook catalog
+  #
+  # Lifecycle hooks (fired by the orchestrator). +trainer+ is the live
+  # CombatTrainer instance and +game_state+ is the current GameState:
+  #
+  #   after_initialize(trainer)                          [notify]
+  #     Fired once when the orchestrator has finished constructing, before
+  #     combat begins. Read settings, open resources, or announce startup here.
+  #
+  #   before_combat(trainer, game_state)                 [notify]
+  #     Fired once at the top of the combat loop, before the first iteration.
+  #
+  #   combat_tick(trainer, game_state, counter:)         [decision]
+  #     Fired once per loop iteration after the combat processes run; +counter+
+  #     is the 1-based iteration count. This is the only lifecycle hook whose
+  #     return value is honored: returning +:break+ stops the combat loop. Any
+  #     other return value is ignored.
+  #
+  #   after_combat(trainer, game_state)                  [notify]
+  #     Fired once after the combat loop exits.
+  #
+  #   cleanup(trainer)                                   [notify]
+  #     Fired from the before_dying teardown (including abnormal exits). Release
+  #     resources here; it is guarded so a failure cannot block shutdown.
+  #
+  # Feature seams (fired by the combat +*Process+ collaborators):
+  #
+  #   warhorn_cooldown_active?(room_id:)                 [decision]
+  #     Decide whether the warhorn/egg room effect is still active in +room_id+.
+  #     Return +true+ to skip a fresh application, +false+ to allow it, or +nil+
+  #     to defer to the built-in per-character 600s timer.
+  #     Fired by {AbilityProcess#room_effect_on_cooldown?}.
+  #
+  #   warhorn_applied(room_id:, type:)                   [notify]
+  #     Announced right after a warhorn/egg effect is applied in +room_id+;
+  #     +type+ is "warhorn" or "egg". Persist the event to an external store
+  #     here. Fired by {AbilityProcess#record_room_effect}.
+  #
+  # This is the current set; more seams may be added over time, so a plugin
+  # should implement only the hooks it needs and tolerate new ones appearing.
+  #
+  # == Calling into a plugin from outside
+  #
+  # Unknown instance calls on the orchestrator are forwarded to the first
+  # registered plugin that responds, so an external script can drive plugin
+  # behavior through the global handle, e.g. +$COMBAT_TRAINER.my_command(arg)+.
+  # See {#method_missing}.
+  #
+  # @example A plugin that logs the lifecycle and stops combat after N ticks
+  #   # scripts/custom/combat-trainer-plugin-ticklimit.rb
+  #   class TickLimitPlugin
+  #     def initialize(max_ticks: 500)
+  #       @max_ticks = max_ticks
+  #     end
+  #
+  #     def after_initialize(_trainer)
+  #       echo "[ticklimit] loaded; will stop after #{@max_ticks} ticks"
+  #     end
+  #
+  #     # Decision hook: returning :break ends the combat loop.
+  #     def combat_tick(_trainer, _game_state, counter:)
+  #       :break if counter >= @max_ticks
+  #     end
+  #
+  #     def cleanup(_trainer)
+  #       echo '[ticklimit] cleaning up'
+  #     end
+  #   end
+  #
+  #   CombatTrainer.register_plugin(TickLimitPlugin.new(max_ticks: 300))
+  #
+  # @see AbilityProcess#room_effect_on_cooldown? the warhorn/egg cooldown seam,
+  #   a worked example of a decision hook.
+  @registered_plugins = []
+
+  class << self
+    # @return [Array<Object>] the plugin instances registered this run, in
+    #   registration (file-load) order.
+    attr_reader :registered_plugins
+
+    # Register a plugin instance to receive lifecycle and decision hooks.
+    #
+    # @param plugin [Object] any object implementing one or more hook methods.
+    # @return [Array<Object>] the updated registry.
+    def register_plugin(plugin)
+      @registered_plugins << plugin
+    end
+
+    # Fire a *decision* hook and return the first non-nil plugin result.
+    #
+    # Plugins that do not implement +hook_name+ are skipped. An exception raised
+    # by a plugin is swallowed (and echoed under +$debug_mode_ct+) so a
+    # misbehaving plugin degrades to combat-trainer's default rather than
+    # aborting combat. Note that a plugin returning +false+ counts as an answer
+    # (it is not +nil+) and therefore short-circuits the poll.
+    #
+    # @param hook_name [Symbol] the hook method to invoke on each plugin.
+    # @param args [Array] positional arguments forwarded to the hook.
+    # @param kwargs [Hash] keyword arguments forwarded to the hook.
+    # @return [Object, nil] the first non-nil return value, or +nil+ if no
+    #   plugin answered.
+    def fire_hook(hook_name, *args, **kwargs)
+      registered_plugins.each do |plugin|
+        next unless plugin.respond_to?(hook_name)
+
+        begin
+          result = plugin.send(hook_name, *args, **kwargs)
+          return result unless result.nil?
+        rescue StandardError => e
+          echo "Plugin #{plugin.class.name} error in #{hook_name}: #{e.message}" if $debug_mode_ct
+        end
+      end
+      nil
+    end
+
+    # Fire a *notification* hook on every plugin that implements it.
+    #
+    # Unlike {fire_hook}, all matching plugins are always invoked and their
+    # return values are ignored. An exception in one plugin is isolated so the
+    # remaining plugins still run.
+    #
+    # @param hook_name [Symbol] the hook method to invoke on each plugin.
+    # @param args [Array] positional arguments forwarded to the hook.
+    # @param kwargs [Hash] keyword arguments forwarded to the hook.
+    # @return [nil]
+    def notify_hook(hook_name, *args, **kwargs)
+      registered_plugins.each do |plugin|
+        next unless plugin.respond_to?(hook_name)
+
+        begin
+          plugin.send(hook_name, *args, **kwargs)
+        rescue StandardError => e
+          echo "Plugin #{plugin.class.name} error in #{hook_name}: #{e.message}" if $debug_mode_ct
+        end
+      end
+      nil
+    end
+  end
+
   attr_reader :running
 
   def stop
@@ -4465,6 +5166,9 @@ class CombatTrainer
     settings.storage_containers.each { |container| fput("open my #{container}") }
     worngear = settings.combat_trainer_gear_set || "standard"
     @equipment_manager.wear_equipment_set?(worngear) if settings.cycle_armors_regalia.nil? || DRCA.parse_regalia.empty?
+
+    # Notify plugins that combat-trainer is fully constructed and ready.
+    self.class.notify_hook(:after_initialize, self)
   end
 
   def set_dance(message, settings)
@@ -4484,7 +5188,7 @@ class CombatTrainer
   def setup(settings)
     Flags.add('ct-spellcast', '^Your formation of a targeting pattern around .+ has completed\.', 'Your target pattern has finished forming around the area', '^You feel fully prepared to cast your spell\.', '^Your spell pattern snaps into shape with little preparation!')
 
-    Flags.add('last-stance', 'Setting your Evasion stance to \d+%, your Parry stance to \d+%, and your Shield stance to \d+%.  You have \d+ stance points left')
+    Flags.add('last-stance', /^Setting your Evasion stance to (?<evasion>\d+)%,.*your Parry stance to (?<parry>\d+)%,.*your Shield stance to (?<shield>\d+)%.*?You have (?<spare>\d+) stance points left/)
 
     DRC.bput("stance set #{settings.default_stance}", 'Setting your')
 
@@ -4516,12 +5220,18 @@ class CombatTrainer
 
   def start_combat
     @equipment_manager.empty_hands
+    self.class.notify_hook(:before_combat, self, @game_state)
+    tick = 0
     loop do
       waitrt?
       @safety_process.execute(@game_state)
       @combat_processes.each do |process|
         break if process.execute(@game_state)
       end
+      tick += 1
+      # Give plugins a per-iteration seam; any plugin returning :break stops combat.
+      break if self.class.fire_hook(:combat_tick, self, @game_state, counter: tick) == :break
+
       pause @loop_tick
       if @game_state.done_cleaning_up?
         echo('CombatTrainer::clean_up') if $debug_mode_ct
@@ -4540,6 +5250,32 @@ class CombatTrainer
       @game_state.stop_weak_attacks
       @game_state.stop_analyze_combo
     end
+    self.class.notify_hook(:after_combat, self, @game_state)
+  end
+
+  # Forward unknown instance calls to the first plugin that implements them.
+  #
+  # This lets external scripts drive plugin behavior through the global
+  # +$COMBAT_TRAINER+ handle (e.g. +$COMBAT_TRAINER.some_plugin_command+)
+  # without combat-trainer needing to know the method name up front.
+  #
+  # @param method_name [Symbol] the missing method.
+  # @param args [Array] positional arguments forwarded to the plugin.
+  # @param kwargs [Hash] keyword arguments forwarded to the plugin.
+  # @return [Object] the responding plugin's return value.
+  # @raise [NoMethodError] if no registered plugin responds to +method_name+.
+  def method_missing(method_name, *args, **kwargs, &block)
+    self.class.registered_plugins.each do |plugin|
+      return plugin.send(method_name, *args, **kwargs, &block) if plugin.respond_to?(method_name)
+    end
+    super
+  end
+
+  # @param method_name [Symbol] the method being checked.
+  # @param include_private [Boolean] whether to consider private methods.
+  # @return [Boolean] +true+ if any registered plugin responds to the method.
+  def respond_to_missing?(method_name, include_private = false)
+    self.class.registered_plugins.any? { |plugin| plugin.respond_to?(method_name) } || super
   end
 end
 
@@ -5877,6 +6613,48 @@ class GameState
     DRCS.pull_summoned_weapon if info['pull']
   end
 
+  # Summoned-weapon-aware "put the current training weapon away" so the hands
+  # are free (e.g. astrology needs both hands for the telescope) or before an
+  # action that stows then re-wields (a sorcery-boosted cast, a cleric ritual).
+  #
+  # A summoned weapon's configured name is the spell noun ("moonblade" /
+  # "moonstaff" / an elemental weapon), which is NOT a gear-list item, so
+  # EquipmentManager#stow_weapon can never match it -- it just leaves the
+  # summoned weapon stuck in hand. For a summoned weapon we instead WEAR it
+  # (moon mage: TK-float it out of the hand) or BREAK it (warrior mage), which
+  # is the same disposition SetupProcess#check_weapon already uses on a weapon
+  # switch. Non-summoned weapons fall through to the normal stow.
+  def stow_or_store_weapon
+    if summoned_info(weapon_skill)
+      if DRStats.moon_mage?
+        DRCMM.wear_moon_weapon?
+      else
+        DRCS.break_summoned_weapon(weapon_name)
+      end
+    else
+      @equipment_manager.stow_weapon(weapon_name)
+    end
+  end
+
+  # Inverse of #stow_or_store_weapon: re-equip the current training weapon after
+  # such an interruption.
+  #
+  # Calling EquipmentManager#wield_weapon? for a summoned weapon prints a
+  # spurious "EquipmentManager: Failed to match a weapon for <name>:<skill>"
+  # (the summoned name is not in the gear list) and re-equips nothing. For a
+  # summoned weapon we re-hold and reshape it instead: moon mage grabs the worn
+  # moonblade back and shapes it, warrior mage re-summons and shapes. Passing
+  # weapon_already_summoned = false makes prepare_summoned_weapon do the summon
+  # step, which for a moon mage is DRCMM.hold_moon_weapon? (re-grab the still
+  # active, worn blade) and for a warrior mage re-summons the broken one.
+  def restore_weapon
+    if summoned_info(weapon_skill)
+      prepare_summoned_weapon(false)
+    else
+      @equipment_manager.wield_weapon?(weapon_name, weapon_skill)
+    end
+  end
+
   def can_ambush_stun?
     !npcs.empty? && !aimed_skill?
   end
@@ -6238,6 +7016,7 @@ before_dying do
   Flags.delete('ct-germshieldlost')
   Flags.delete('ct-itemdropped')
   Flags.delete('ct-shock-warning')
+  Flags.delete('ct-spell-unknown')
   Flags.delete('ct-maneuver-cooldown-reduced')
   Flags.delete('ct-attack-out-of-range')
   Flags.delete('ct-battle-cry-not-facing')
@@ -6245,6 +7024,21 @@ before_dying do
   Flags.delete('ct-barbarian-whirlwind-expired')
   Flags.delete('war-stomp-ready')
   Flags.delete('pounce-ready')
+
+  # Let plugins release any resources they acquired.
+  CombatTrainer.notify_hook(:cleanup, $COMBAT_TRAINER)
+end
+
+# Load combat-trainer plugins from the custom directory. Each plugin file is
+# expected to register itself via CombatTrainer.register_plugin(...). Plugins
+# must load before CombatTrainer.new so their :after_initialize hook fires. A
+# failure to load one plugin must not prevent combat-trainer from starting.
+Dir.glob(File.join(SCRIPT_DIR, 'custom', 'combat-trainer-plugin-*.rb')).sort.each do |plugin_file|
+  load plugin_file
+rescue ScriptError, StandardError => e
+  # ScriptError (SyntaxError/LoadError) does not descend from StandardError, so
+  # it must be named explicitly or a malformed plugin file would abort startup.
+  echo "Failed to load combat-trainer plugin #{File.basename(plugin_file)}: #{e.message}"
 end
 
 $COMBAT_TRAINER = CombatTrainer.new

@@ -33,6 +33,11 @@ RSpec.describe TendMe do
       expect(tender.tend_wound_safely('right arm')).to be true
     end
 
+    it 'returns true when a parasite slips free' do
+      allow(DRC).to receive(:bput).and_return('The blood mite slips free and quickly slithers away, vanishing from sight within moments.')
+      expect(tender.tend_wound_safely('right arm')).to be true
+    end
+
     it 'returns false when the tend fumbles' do
       allow(DRC).to receive(:bput).and_return('You fumble around with the bandages.')
       expect(tender.tend_wound_safely('right arm')).to be false
@@ -41,6 +46,16 @@ RSpec.describe TendMe do
     it 'returns false when too injured to tend' do
       allow(DRC).to receive(:bput).and_return('You are too injured for you to do that.')
       expect(tender.tend_wound_safely('right arm')).to be false
+    end
+
+    it 'returns false on a careless tend attempt' do
+      allow(DRC).to receive(:bput).and_return('You carelessly attempt to remove the blood mite from your neck leaving the wound more severe than before.')
+      expect(tender.tend_wound_safely('neck')).to be false
+    end
+
+    it 'returns false on a foolish tend attempt' do
+      allow(DRC).to receive(:bput).and_return('You foolishly attempt to remove the blood mite from your right eye tearing the flesh and horribly aggravating the wound!')
+      expect(tender.tend_wound_safely('right eye')).to be false
     end
 
     it 'passes the person argument through to the tend command' do
@@ -123,6 +138,39 @@ RSpec.describe TendMe do
       tender.tend_wound_safely('chest', 'Muleoak')
 
       expect(DRC).to have_received(:bput).with('tend Muleoak chest', any_args).twice
+    end
+  end
+
+  describe '#bind_open_wounds?' do
+    subject(:tend_me) { TendMe.allocate }
+
+    def tendme_health_result(overrides = {})
+      { 'lodged' => {}, 'parasites' => {}, 'bleeders' => {} }.merge(overrides)
+    end
+
+    before(:each) do
+      reset_data
+      allow(DRCH).to receive(:check_health).and_return(tendme_health_result)
+    end
+
+    it 'lifts the item back up after lowering it to free a hand for binding' do
+      $left_hand = 'broadsword'
+      $right_hand = 'buckler'
+      allow(DRCI).to receive(:lower_item?).and_return(true)
+
+      expect(DRCI).to receive(:lift?).with('broadsword')
+
+      tend_me.bind_open_wounds?
+    end
+
+    it 'does not lower or lift anything when a hand is free' do
+      $left_hand = 'broadsword'
+      $right_hand = nil
+
+      expect(DRCI).not_to receive(:lower_item?)
+      expect(DRCI).not_to receive(:lift?)
+
+      tend_me.bind_open_wounds?
     end
   end
 end

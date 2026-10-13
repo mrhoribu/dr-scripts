@@ -185,10 +185,6 @@ RSpec.describe Forge do
       expect(Forge::FORGE_EMPTY_PATTERN).to eq('There is nothing')
     end
 
-    it 'defines DEFAULT_PRIVATE_FORGE_COST as 5000 copper (5 plat)' do
-      expect(Forge::DEFAULT_PRIVATE_FORGE_COST).to eq(5000)
-    end
-
     it 'defines PRIVATE_FORGE_ENTRY_SUCCESS as frozen array' do
       expect(Forge::PRIVATE_FORGE_ENTRY_SUCCESS).to be_frozen
       expect(Forge::PRIVATE_FORGE_ENTRY_SUCCESS).to include('You head through')
@@ -579,7 +575,10 @@ RSpec.describe Forge do
       it 'gets item when not in left hand' do
         allow(DRCI).to receive(:in_left_hand?).with('sword').and_return(false, true)
         allow(DRCI).to receive(:in_right_hand?).and_return(false)
-        expect(DRCC).to receive(:stow_crafting_item)
+        # prepare_item_in_left_hand/handle_oiling now stow BOTH hands (via
+        # stow_both_hands) before retrieving the item, so stow_crafting_item is
+        # called once per hand.
+        expect(DRCC).to receive(:stow_crafting_item).twice
         expect(DRC).to receive(:bput).with('get sword on anvil', 'You get', 'What were you referring to?').and_return('You get')
         expect(forge_instance).to receive(:swap_tool).with('oil', true)
         forge_instance.send(:handle_oiling)
@@ -596,6 +595,48 @@ RSpec.describe Forge do
         forge_instance.send(:handle_oiling)
         expect(forge_instance.instance_variable_get(:@command)).to eq('pour my oil on my sword')
         expect(forge_instance).to have_received(:swap_tool).with('oil', true)
+      end
+    end
+
+    describe '#forge_in_room? and #ensure_forge (temper forge guard)' do
+      it 'FORGE_MISSING_PATTERN matches no-forge responses' do
+        expect(Forge::FORGE_MISSING_PATTERN).to be_a(Regexp)
+        expect('I could not find').to match(Forge::FORGE_MISSING_PATTERN)
+        expect('What were you referring to').to match(Forge::FORGE_MISSING_PATTERN)
+      end
+
+      it 'forge_in_room? is true when the forge holds an item' do
+        allow(DRC).to receive(:bput).and_return(Forge::FORGE_HAS_ITEM_PATTERN)
+        expect(forge_instance.send(:forge_in_room?)).to be true
+      end
+
+      it 'forge_in_room? is true when the forge is empty' do
+        allow(DRC).to receive(:bput).and_return(Forge::FORGE_EMPTY_PATTERN)
+        expect(forge_instance.send(:forge_in_room?)).to be true
+      end
+
+      it 'forge_in_room? is false when there is no forge in the room' do
+        allow(DRC).to receive(:bput).and_return('I could not find')
+        expect(forge_instance.send(:forge_in_room?)).to be false
+      end
+
+      it 'ensure_forge does not search when a forge is already present' do
+        allow(forge_instance).to receive(:forge_in_room?).and_return(true)
+        expect(DRCC).not_to receive(:find_anvil)
+        forge_instance.send(:ensure_forge)
+      end
+
+      it 'ensure_forge walks to a free anvil room when the current room has no forge' do
+        allow(forge_instance).to receive(:forge_in_room?).and_return(false, true)
+        expect(DRCC).to receive(:find_anvil).with('Crossing')
+        forge_instance.send(:ensure_forge)
+      end
+
+      it 'ensure_forge exits when no forge can be found even after searching' do
+        allow(forge_instance).to receive(:forge_in_room?).and_return(false, false)
+        allow(DRCC).to receive(:find_anvil)
+        expect(forge_instance).to receive(:cleanup_and_exit).with(/Could not find a forge/)
+        forge_instance.send(:ensure_forge)
       end
     end
 
@@ -1017,6 +1058,28 @@ RSpec.describe Forge do
         expect(forge_instance.instance_variable_get(:@home_tool)).to eq('forging hammer')
         expect(forge_instance.instance_variable_get(:@location)).to eq('on anvil')
       end
+    end
+  end
+
+  # The dr-scripts harness stubs a DRCC without the new private-forge helpers,
+  # so these exercise forge's local fallbacks (the path on an older lich-5).
+  describe 'private-forge settings (gated DRCC helpers with local fallback)' do
+    let(:forge_instance) { Forge.allocate }
+
+    it 'crafting_hometown prefers force_crafting_town over hometown' do
+      expect(forge_instance.send(:crafting_hometown, OpenStruct.new(force_crafting_town: 'Shard', hometown: 'Crossing'))).to eq('Shard')
+      expect(forge_instance.send(:crafting_hometown, OpenStruct.new(hometown: 'Crossing'))).to eq('Crossing')
+    end
+
+    it 'use_private_forge? honors use_private_forge and the legacy forge_use_private_forge' do
+      expect(forge_instance.send(:use_private_forge?, OpenStruct.new(use_private_forge: true))).to be true
+      expect(forge_instance.send(:use_private_forge?, OpenStruct.new(forge_use_private_forge: true))).to be true
+      expect(forge_instance.send(:use_private_forge?, OpenStruct.new)).to be false
+    end
+
+    it 'private_forge_cost uses the setting, else defaults to 50_000' do
+      expect(forge_instance.send(:private_forge_cost, OpenStruct.new(forge_private_forge_cost: 7_500))).to eq(7_500)
+      expect(forge_instance.send(:private_forge_cost, OpenStruct.new)).to eq(50_000)
     end
   end
 end

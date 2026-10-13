@@ -87,6 +87,7 @@ load_lic_class('combat-trainer.lic', 'SafetyProcess')
 load_lic_class('combat-trainer.lic', 'SpellProcess')
 load_lic_class('combat-trainer.lic', 'PetProcess')
 load_lic_class('combat-trainer.lic', 'TrainerProcess')
+load_lic_class('combat-trainer.lic', 'CombatTrainer')
 
 # Shared setup for combat-trainer tests that need game state stubs.
 # Include in each describe block via: before(:each) { ct_setup }
@@ -135,9 +136,52 @@ def build_game_state(**attrs)
   state
 end
 
-def stub_right_hand_with_id(id)
-  hand = OpenStruct.new(name: 'item', noun: 'item', id: id)
-  allow(GameObj).to receive(:right_hand).and_return(hand)
+# A hand as Lich reports it: +name+ is GameObj's short name (e.g.
+# "mammoth-tusk warhorn"), +noun+ its last word; an empty hand is an "Empty"
+# placeholder with a nil id, never nil.
+#
+# @param id [String, nil] game ID of the held item, or nil for an empty hand
+# @param name [String, nil] short name of the held item
+# @return [OpenStruct]
+def hand_object(id = nil, name = nil)
+  return OpenStruct.new(id: nil, noun: 'Empty', name: 'Empty') unless id
+
+  OpenStruct.new(id: id, noun: name.split.last, name: name)
+end
+
+# Stubs both hands with live state that #take_into_hand and the stubbed
+# DRCI.stow_item?/wear_item? change, following the game's rules: a fetched
+# item goes to the right hand if it is free, else the left; stowing or
+# wearing an item by "#id" empties its hand.
+#
+# @param right [Array(String, String), nil] [id, short name] held in the right hand
+# @param left [Array(String, String), nil] [id, short name] held in the left hand
+# @return [Hash{Symbol=>OpenStruct}] the live hands, keyed :right and :left
+def stub_hands(right: nil, left: nil)
+  hands = { right: hand_object(*right), left: hand_object(*left) }
+  allow(GameObj).to receive(:right_hand) { hands[:right] }
+  allow(GameObj).to receive(:left_hand) { hands[:left] }
+  put_away = lambda do |ref|
+    slot = hands.key(hands.values.find { |hand| "##{hand.id}" == ref })
+    hands[slot] = hand_object if slot
+    true
+  end
+  allow(DRCI).to receive(:stow_item?, &put_away)
+  allow(DRCI).to receive(:wear_item?, &put_away)
+  hands
+end
+
+# The game putting a fetched item in a hand: the right one if free, else the
+# left.
+#
+# @param hands [Hash{Symbol=>OpenStruct}] live hands from #stub_hands
+# @param id [String] game ID of the fetched item
+# @param name [String] its short name
+# @return [true] so it can end a stubbed DRCI.get_item?/remove_item? block
+def take_into_hand(hands, id, name)
+  slot = hands[:right].id.nil? ? :right : :left
+  hands[slot] = hand_object(id, name)
+  true
 end
 
 # ===================================================================
@@ -544,17 +588,27 @@ end
 RSpec.describe ManipulateProcess do
   before(:each) { ct_setup }
 
-  def build_manipulate(threshold: 2, manip_to_train: false, last_manip: Time.now - 200)
+  def build_manipulate(threshold: 2, manip_to_train: false, last_manip: Time.now - 200, ignored_npcs: [])
     mp = ManipulateProcess.allocate
     mp.instance_variable_set(:@threshold, threshold)
     mp.instance_variable_set(:@manip_to_train, manip_to_train)
     mp.instance_variable_set(:@last_manip, last_manip)
+    mp.instance_variable_set(:@ignored_npcs, ignored_npcs)
     mp
   end
 
   def gs_double(**attrs)
-    defaults = { danger: false, construct_mode?: false, npcs: %w[rat kobold] }
+    defaults = { danger: false, construct_mode?: false }
     double('GameState', defaults.merge(attrs))
+  end
+
+  # Live, hostile creatures are now sourced from Creature.targets, keyed by id.
+  def seed_targets(*creatures)
+    Lich::DragonRealms::Creature._set_room(creatures)
+  end
+
+  def creature(id:, noun: 'rat', name: 'a giant rat')
+    OpenStruct.new(id: id, noun: noun, name: name)
   end
 
   describe '#execute' do
@@ -581,17 +635,32 @@ RSpec.describe ManipulateProcess do
 
     it 'skips when empathy XP > 30 and manip_to_train set' do
       allow(DRSkill).to receive(:getxp).with('Empathy').and_return(31)
+      seed_targets(creature(id: 1))
       mp = build_manipulate(manip_to_train: true)
       mp.execute(gs_double)
       expect(mp.instance_variable_get(:@threshold)).not_to be_nil
     end
 
-    it 'manipulates when threshold met and cooldown elapsed' do
+    it 'manipulates live targets by id when threshold met and cooldown elapsed' do
       allow(DRSkill).to receive(:getxp).and_return(10)
       allow(DRC).to receive(:bput).and_return('You attempt to empathically manipulate')
-      gs = gs_double(npcs: %w[rat kobold])
+      seed_targets(creature(id: 1, noun: 'rat'), creature(id: 2, noun: 'kobold', name: 'a kobold'))
+      gs = gs_double
       allow(gs).to receive(:construct?).and_return(false)
       build_manipulate(threshold: 2).execute(gs)
+      expect(DRC).to have_received(:bput).with('manipulate friendship #1', any_args)
+      expect(DRC).to have_received(:bput).with('manipulate friendship #2', any_args)
+    end
+
+    it 'excludes ignored npcs from the manipulate set' do
+      allow(DRSkill).to receive(:getxp).and_return(10)
+      allow(DRC).to receive(:bput).and_return('You attempt to empathically manipulate')
+      seed_targets(creature(id: 1, noun: 'rat'), creature(id: 2, noun: 'kobold', name: 'a kobold'))
+      gs = gs_double
+      allow(gs).to receive(:construct?).and_return(false)
+      build_manipulate(threshold: 1, ignored_npcs: ['kobold']).execute(gs)
+      expect(DRC).to have_received(:bput).with('manipulate friendship #1', any_args)
+      expect(DRC).not_to have_received(:bput).with('manipulate friendship #2', any_args)
     end
 
     # BUG-FINDING: shock disables manipulation permanently for this hunt
@@ -599,38 +668,42 @@ RSpec.describe ManipulateProcess do
       allow(DRSkill).to receive(:getxp).and_return(10)
       allow(DRC).to receive(:bput).and_return('deep sense of loss')
       allow(DRC).to receive(:message)
-      gs = gs_double(npcs: ['rat'])
+      seed_targets(creature(id: 1))
+      gs = gs_double
       allow(gs).to receive(:construct?).and_return(false)
       mp = build_manipulate(threshold: 1)
       mp.execute(gs)
       expect(mp.instance_variable_get(:@threshold)).to be_nil
     end
 
-    # BUG-FINDING: verify construct marking propagates to game_state
+    # BUG-FINDING: verify construct marking propagates to game_state, keyed by noun
     it 'marks NPC as construct and that state persists' do
       allow(DRSkill).to receive(:getxp).and_return(10)
       allow(DRC).to receive(:bput).and_return('does not seem to have a life essence')
-      gs = gs_double(npcs: ['golem'])
+      seed_targets(creature(id: 1, noun: 'golem', name: 'a golem'))
+      gs = gs_double
       allow(gs).to receive(:construct?).and_return(false)
       expect(gs).to receive(:construct).with('golem')
       build_manipulate(threshold: 1).execute(gs)
     end
 
-    # BUG-FINDING: threshold 0 with empty npcs still enters manipulate
+    # BUG-FINDING: threshold 0 with empty roster still enters manipulate
     # (0 >= 0 is true), verifying the loop body is a no-op
-    it 'threshold 0 with empty npcs enters manipulate but does nothing offensive' do
+    it 'threshold 0 with empty roster enters manipulate but does nothing offensive' do
       allow(DRSkill).to receive(:getxp).and_return(10)
       allow(DRC).to receive(:bput).and_return("But you aren't manipulating anything")
+      seed_targets
       mp = build_manipulate(threshold: 0)
-      mp.execute(gs_double(npcs: []))
+      mp.execute(gs_double)
       expect(mp.instance_variable_get(:@last_manip)).to be_within(2).of(Time.now)
     end
 
     # BUG-FINDING: cooldown boundary -- 119 seconds should NOT trigger (needs > 120)
     it 'does not manipulate at 119s cooldown' do
       allow(DRSkill).to receive(:getxp).and_return(10)
+      seed_targets(creature(id: 1))
       mp = build_manipulate(threshold: 1, last_manip: Time.now - 119)
-      gs = gs_double(npcs: ['rat'])
+      gs = gs_double
       allow(gs).to receive(:construct?).and_return(false)
       mp.execute(gs)
       expect(mp.instance_variable_get(:@last_manip)).to be < Time.now - 100
@@ -640,7 +713,8 @@ RSpec.describe ManipulateProcess do
     it 'manipulates at 121s cooldown' do
       allow(DRSkill).to receive(:getxp).and_return(10)
       allow(DRC).to receive(:bput).and_return('You attempt to empathically manipulate')
-      gs = gs_double(npcs: ['rat'])
+      seed_targets(creature(id: 1))
+      gs = gs_double
       allow(gs).to receive(:construct?).and_return(false)
       mp = build_manipulate(threshold: 1, last_manip: Time.now - 121)
       mp.execute(gs)
@@ -836,6 +910,58 @@ RSpec.describe AbilityProcess do
       allow(gs).to receive(:npcs).and_return(['rat'])
       build_ability(pounce_on_cooldown: true).execute(gs)
       expect(gs).not_to have_received(:pounce)
+    end
+  end
+
+  # -----------------------------------------------------------------
+  # #check_battle_cries -- DRRoom->Creature target migration.
+  # A target_enemy battle cry now resolves its NOUN to a live creature
+  # id (#<id>) at command time, falling back to the noun when no live
+  # match exists. The readiness gate likewise uses live creatures.
+  # -----------------------------------------------------------------
+  describe '#check_battle_cries live-creature targeting' do
+    def build_cry_ability
+      ap = build_ability(
+        battle_cries: [{ 'name' => 'Roar', 'command' => 'roar', 'target_enemy' => 'orc' }],
+        battle_cry_cycle: ['Roar']
+      )
+      allow(ap).to receive(:waitrt?)
+      allow(ap).to receive(:fput)
+      ap
+    end
+
+    it 'targets a live orc by creature id (at #222), not the noun' do
+      allow(Lich::DragonRealms::Creature).to receive(:targets)
+        .and_return([OpenStruct.new(id: 222, noun: 'orc', name: 'an orc')])
+      ap = build_cry_ability
+      ap.send(:check_battle_cries, gs_double)
+      expect(ap).to have_received(:fput).with('roar at #222')
+    end
+
+    # Fallback: the gate saw a live orc, but by command time the creature
+    # is gone (e.g. died, or the name-less window). find returns nil, so
+    # the command falls back to the configured noun.
+    it 'falls back to the noun (at orc) when no live creature matches' do
+      allow(Lich::DragonRealms::Creature).to receive(:targets)
+        .and_return([OpenStruct.new(id: 222, noun: 'orc', name: 'an orc')], [])
+      ap = build_cry_ability
+      ap.send(:check_battle_cries, gs_double)
+      expect(ap).to have_received(:fput).with('roar at orc')
+    end
+
+    it 'gate keeps a target_enemy battle cry when a live match exists' do
+      allow(Lich::DragonRealms::Creature).to receive(:targets)
+        .and_return([OpenStruct.new(id: 222, noun: 'orc', name: 'an orc')])
+      ap = build_cry_ability
+      ap.send(:check_battle_cries, gs_double)
+      expect(ap).to have_received(:fput).with('roar at #222')
+    end
+
+    it 'gate drops a target_enemy battle cry when no live creature matches' do
+      allow(Lich::DragonRealms::Creature).to receive(:targets).and_return([])
+      ap = build_cry_ability
+      ap.send(:check_battle_cries, gs_double)
+      expect(ap).not_to have_received(:fput)
     end
   end
 end
@@ -1260,8 +1386,10 @@ RSpec.describe 'Multi-tick simulation' do
     mp.instance_variable_set(:@threshold, 1)
     mp.instance_variable_set(:@manip_to_train, false)
     mp.instance_variable_set(:@last_manip, Time.now - 200)
+    mp.instance_variable_set(:@ignored_npcs, [])
+    Lich::DragonRealms::Creature._set_room([OpenStruct.new(id: 1, noun: 'rat', name: 'a giant rat')])
 
-    gs = double('GameState', danger: false, construct_mode?: false, npcs: ['rat'])
+    gs = double('GameState', danger: false, construct_mode?: false)
     allow(gs).to receive(:construct?).and_return(false)
 
     manip_count = 0
@@ -1385,8 +1513,13 @@ RSpec.describe 'Nil and type-confused settings' do
     mp.instance_variable_set(:@threshold, "2".to_i)
     mp.instance_variable_set(:@manip_to_train, false)
     mp.instance_variable_set(:@last_manip, Time.now - 200)
+    mp.instance_variable_set(:@ignored_npcs, [])
+    Lich::DragonRealms::Creature._set_room([
+                                             OpenStruct.new(id: 1, noun: 'rat', name: 'a giant rat'),
+                                             OpenStruct.new(id: 2, noun: 'kobold', name: 'a kobold')
+                                           ])
 
-    gs = double('GameState', danger: false, construct_mode?: false, npcs: %w[rat kobold])
+    gs = double('GameState', danger: false, construct_mode?: false)
     allow(gs).to receive(:construct?).and_return(false)
 
     expect { mp.execute(gs) }.not_to raise_error
@@ -1521,9 +1654,44 @@ RSpec.describe SetupProcess do
     SetupProcess.allocate
   end
 
+  # A fired flag holds the MatchData from its registered regex, NOT a String or
+  # Array: DRParser.check_events does `Flags.flags[key] = server_string.match(regex)`.
+  # last_stance reads Flags['last-stance'] by named capture (:evasion, :parry,
+  # :shield, :spare), so the fixture has to be a real MatchData with those
+  # captures. We extract the exact regex the script registers so a capture-name
+  # drift between Flags.add('last-stance', ...) and last_stance fails here
+  # instead of shipping a script that silently reads all zeros.
+  def registered_last_stance_regex
+    filepath = File.join(File.dirname(__FILE__), '..', 'combat-trainer.lic')
+    line = File.readlines(filepath).find { |l| l.include?("Flags.add('last-stance'") }
+    raise "Flags.add('last-stance', ...) not found in combat-trainer.lic" unless line
+
+    eval(line[%r{Flags\.add\('last-stance',\s*(/.*/)\)}, 1])
+  end
+
+  # Build the MatchData production would store for the given stance percentages
+  # by matching a real game line against the registered regex.
+  def last_stance_flag(evasion:, parry:, shield:, spare:)
+    line = "Setting your Evasion stance to #{evasion}%, your Parry stance to #{parry}%, " \
+           "your Shield stance to #{shield}%.  You have #{spare} stance points left."
+    line.match(registered_last_stance_regex) ||
+      raise("sample stance line did not match the registered regex: #{line.inspect}")
+  end
+
   describe '#last_stance' do
-    context 'when Flags[last-stance] has not fired yet (nil)' do
-      it 'returns zeroed stance hash instead of raising NoMethodError' do
+    context 'when the flag has never fired (registered default is false)' do
+      it 'returns a zeroed stance hash instead of indexing false' do
+        Flags['last-stance'] = false
+        instance = build_setup_process
+
+        result = instance.send(:last_stance)
+
+        expect(result).to eq({ 'EVASION' => 0, 'PARRY' => 0, 'SHIELD' => 0, 'SPARE' => 0 })
+      end
+    end
+
+    context 'when the flag was cleared to nil' do
+      it 'returns a zeroed stance hash instead of raising NoMethodError' do
         Flags['last-stance'] = nil
         instance = build_setup_process
 
@@ -1533,9 +1701,9 @@ RSpec.describe SetupProcess do
       end
     end
 
-    context 'when Flags[last-stance] has a valid stance string' do
-      it 'parses the percentages correctly' do
-        Flags['last-stance'] = ['80% pointed stance 60% pointed stance 40% pointed stance 20']
+    context 'when the flag holds a fired stance MatchData' do
+      it 'parses each named capture into an integer percentage' do
+        Flags['last-stance'] = last_stance_flag(evasion: 80, parry: 60, shield: 40, spare: 20)
         instance = build_setup_process
 
         result = instance.send(:last_stance)
@@ -1544,9 +1712,9 @@ RSpec.describe SetupProcess do
       end
     end
 
-    context 'when Flags[last-stance] has all zeros' do
-      it 'returns all zeros' do
-        Flags['last-stance'] = ['0% pointed stance 0% pointed stance 0% pointed stance 0']
+    context 'when a fired stance MatchData is all zeros' do
+      it 'returns all zeros via the parse path, not the unfired-flag guard' do
+        Flags['last-stance'] = last_stance_flag(evasion: 0, parry: 0, shield: 0, spare: 0)
         instance = build_setup_process
 
         result = instance.send(:last_stance)
@@ -1558,7 +1726,11 @@ RSpec.describe SetupProcess do
 end
 
 # ===========================================================================
-# ManipulateProcess#manipulate -- ordinal targeting for duplicate NPCs
+# ManipulateProcess#manipulate -- id-based targeting (no ordinals)
+#
+# Duplicate same-noun mobs are told apart by their stable <crtrStatus> id,
+# so the old $ORDINALS "second kobold" disambiguation is gone: every
+# manipulate addresses '#<id>'.
 # ===========================================================================
 RSpec.describe ManipulateProcess do
   def build_manipulate_process(**overrides)
@@ -1567,7 +1739,8 @@ RSpec.describe ManipulateProcess do
       threshold: 5,
       manip_to_train: false,
       last_manip: Time.now - 200,
-      filtered_npcs: []
+      ignored_npcs: [],
+      targets: []
     }
     defaults.merge(overrides).each do |k, v|
       instance.instance_variable_set(:"@#{k}", v)
@@ -1576,15 +1749,14 @@ RSpec.describe ManipulateProcess do
   end
 
   def build_game_state(**attrs)
-    defaults = {
-      npcs: [],
-      danger: false,
-      construct_mode?: false
-    }
-    state = double('GameState', defaults.merge(attrs))
+    state = double('GameState', { danger: false, construct_mode?: false }.merge(attrs))
     allow(state).to receive(:construct?).and_return(false)
     allow(state).to receive(:construct)
     state
+  end
+
+  def creature(id:, noun: 'rat', name: 'a giant rat')
+    OpenStruct.new(id: id, noun: noun, name: name)
   end
 
   describe '#manipulate' do
@@ -1592,70 +1764,54 @@ RSpec.describe ManipulateProcess do
       allow(DRC).to receive(:bput).and_return('You attempt to empathically manipulate')
     end
 
-    context 'when all NPCs have different nouns' do
-      it 'uses "first" ordinal for each NPC' do
+    context 'when all creatures have different nouns' do
+      it 'targets each creature by its id' do
         game_state = build_game_state
         instance = build_manipulate_process(
           threshold: 3,
-          filtered_npcs: %w[rat kobold goblin]
+          targets: [creature(id: 11, noun: 'rat'), creature(id: 22, noun: 'kobold'), creature(id: 33, noun: 'goblin')]
         )
 
         instance.send(:manipulate, game_state)
 
-        expect(DRC).to have_received(:bput).with(/manipulate friendship first rat/, any_args)
-        expect(DRC).to have_received(:bput).with(/manipulate friendship first kobold/, any_args)
-        expect(DRC).to have_received(:bput).with(/manipulate friendship first goblin/, any_args)
+        expect(DRC).to have_received(:bput).with('manipulate friendship #11', any_args)
+        expect(DRC).to have_received(:bput).with('manipulate friendship #22', any_args)
+        expect(DRC).to have_received(:bput).with('manipulate friendship #33', any_args)
       end
     end
 
-    context 'when multiple NPCs share the same noun' do
-      it 'uses incrementing ordinals for duplicate nouns' do
+    context 'when multiple creatures share the same noun' do
+      it 'tells them apart by distinct id, with no ordinal prefixes' do
         game_state = build_game_state
         instance = build_manipulate_process(
           threshold: 3,
-          filtered_npcs: %w[rat rat rat]
+          targets: [creature(id: 11, noun: 'rat'), creature(id: 12, noun: 'rat'), creature(id: 13, noun: 'rat')]
         )
 
         instance.send(:manipulate, game_state)
 
-        expect(DRC).to have_received(:bput).with(/manipulate friendship first rat/, any_args)
-        expect(DRC).to have_received(:bput).with(/manipulate friendship second rat/, any_args)
-        expect(DRC).to have_received(:bput).with(/manipulate friendship third rat/, any_args)
+        expect(DRC).to have_received(:bput).with('manipulate friendship #11', any_args)
+        expect(DRC).to have_received(:bput).with('manipulate friendship #12', any_args)
+        expect(DRC).to have_received(:bput).with('manipulate friendship #13', any_args)
+        expect(DRC).not_to have_received(:bput).with(/first|second|third/, any_args)
       end
     end
 
-    context 'when mixed duplicate and unique NPCs are present' do
-      it 'tracks ordinals independently per noun' do
-        game_state = build_game_state
-        instance = build_manipulate_process(
-          threshold: 4,
-          filtered_npcs: %w[rat kobold rat kobold]
-        )
-
-        instance.send(:manipulate, game_state)
-
-        expect(DRC).to have_received(:bput).with(/manipulate friendship first rat/, any_args)
-        expect(DRC).to have_received(:bput).with(/manipulate friendship first kobold/, any_args)
-        expect(DRC).to have_received(:bput).with(/manipulate friendship second rat/, any_args)
-        expect(DRC).to have_received(:bput).with(/manipulate friendship second kobold/, any_args)
-      end
-    end
-
-    context 'when an NPC is a construct' do
-      it 'skips constructs and does not increment ordinal for that noun' do
+    context 'when a creature is a construct' do
+      it 'skips it by noun and manipulates the rest by id' do
         game_state = build_game_state
         allow(game_state).to receive(:construct?).with('golem').and_return(true)
         allow(game_state).to receive(:construct?).with('rat').and_return(false)
 
         instance = build_manipulate_process(
           threshold: 2,
-          filtered_npcs: %w[golem rat]
+          targets: [creature(id: 11, noun: 'golem'), creature(id: 22, noun: 'rat')]
         )
 
         instance.send(:manipulate, game_state)
 
-        expect(DRC).not_to have_received(:bput).with(/manipulate friendship .* golem/, any_args)
-        expect(DRC).to have_received(:bput).with(/manipulate friendship first rat/, any_args)
+        expect(DRC).not_to have_received(:bput).with('manipulate friendship #11', any_args)
+        expect(DRC).to have_received(:bput).with('manipulate friendship #22', any_args)
       end
     end
 
@@ -1664,14 +1820,33 @@ RSpec.describe ManipulateProcess do
         game_state = build_game_state
         instance = build_manipulate_process(
           threshold: 2,
-          filtered_npcs: %w[rat rat rat]
+          targets: [creature(id: 11, noun: 'rat'), creature(id: 12, noun: 'rat'), creature(id: 13, noun: 'rat')]
         )
 
         instance.send(:manipulate, game_state)
 
-        expect(DRC).to have_received(:bput).with(/manipulate friendship first rat/, any_args)
-        expect(DRC).to have_received(:bput).with(/manipulate friendship second rat/, any_args)
-        expect(DRC).not_to have_received(:bput).with(/manipulate friendship third rat/, any_args)
+        expect(DRC).to have_received(:bput).with('manipulate friendship #11', any_args)
+        expect(DRC).to have_received(:bput).with('manipulate friendship #12', any_args)
+        expect(DRC).not_to have_received(:bput).with('manipulate friendship #13', any_args)
+      end
+    end
+
+    context 'during the name-less crtrStatus window' do
+      # An id can arrive before its noun. We still manipulate it by id, and
+      # never construct-mark a nil noun.
+      it 'manipulates a nil-noun creature by id and does not construct-mark it' do
+        game_state = build_game_state
+        allow(DRC).to receive(:bput).and_return('does not seem to have a life essence')
+
+        instance = build_manipulate_process(
+          threshold: 1,
+          targets: [creature(id: 55, noun: nil, name: nil)]
+        )
+
+        instance.send(:manipulate, game_state)
+
+        expect(DRC).to have_received(:bput).with('manipulate friendship #55', any_args)
+        expect(game_state).not_to have_received(:construct)
       end
     end
   end
@@ -1693,11 +1868,10 @@ RSpec.describe SafetyProcess do
       equipment_manager: double('EquipmentManager'),
       health_threshold: 20,
       stop_on_bleeding: true,
-      safety_untendable_threshold: 3,
       safety_exit_on_bleeding: false,
+      safety_exit_when_stunned: false,
       safety_concentration_minimum: nil,
-      safety_escape_health_threshold: nil,
-      untendable_counter: 0
+      safety_escape_health_threshold: nil
     }
     defaults.merge(overrides).each do |k, v|
       instance.instance_variable_set(:"@#{k}", v)
@@ -1708,7 +1882,8 @@ RSpec.describe SafetyProcess do
   def build_game_state(**attrs)
     defaults = {
       danger: false,
-      retreating?: false
+      retreating?: false,
+      cleaning_up?: false
     }
     state = double('GameState', defaults.merge(attrs))
     allow(state).to receive(:danger=)
@@ -1730,51 +1905,239 @@ RSpec.describe SafetyProcess do
     allow(DRCA).to receive(:activate_khri?).and_return(true)
   end
 
+  # DAMP helper: build a SafetyProcess, stub the post-safety tail, seed the exact
+  # game-state the safety branches read, then run one execute tick. Returns the
+  # instance so a caller can assert on the $HUNTING_BUDDY / $COMBAT_TRAINER doubles.
+  # Every scenario reads as one line: `run_safety_tick(bleeding: true, active_spells: { 'Heal' => 5 }, health: 80)`.
+  def run_safety_tick(bleeding: false, stunned: false, health: 100, concentration: 100,
+                      active_spells: {}, **process_overrides)
+    instance = build_safety_process(**process_overrides)
+    stub_post_safety(instance)
+    allow(instance).to receive(:bleeding?).and_return(bleeding)
+    allow(instance).to receive(:stunned?).and_return(stunned)
+    DRStats.health = health
+    DRStats.concentration = concentration
+    DRSpells._set_active_spells(active_spells)
+    instance.execute(build_game_state)
+    instance
+  end
+
   describe '#execute' do
-    describe 'safety_untendable_threshold' do
-      it 'stops hunt at default threshold of 3' do
-        instance = build_safety_process(untendable_counter: 3)
-        stub_post_safety(instance)
-        allow(instance).to receive(:bleeding?).and_return(true) # stop is gated on active bleeding
-        game_state = build_game_state
+    # Readable assertion pairs. A "stop" means BOTH the parent hunt loop and the
+    # combat-trainer itself are told to stop; a "continue" means neither is.
+    def expect_hunt_stopped
+      expect($HUNTING_BUDDY).to have_received(:stop_hunting)
+      expect($COMBAT_TRAINER).to have_received(:stop)
+    end
 
-        instance.execute(game_state)
+    def expect_hunt_continued
+      expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+      expect($COMBAT_TRAINER).not_to have_received(:stop)
+    end
 
-        expect($HUNTING_BUDDY).to have_received(:stop_hunting)
+    # The bug: stop_hunting_if_bleeding was gated behind an unreliable tend-failure
+    # counter, so it never reliably stopped the hunt. It now stops as soon as we are
+    # bleeding (default-on), unless a heal-over-time spell is tending us and vitality
+    # is still healthy -- see the heal-over-time block below.
+    describe 'stop_hunting_if_bleeding' do
+      it 'stops the hunt as soon as bleeding with no heal-over-time active' do
+        run_safety_tick(stop_on_bleeding: true, bleeding: true)
+        expect_hunt_stopped
+      end
+
+      it 'does not stop when not bleeding' do
+        run_safety_tick(stop_on_bleeding: true, bleeding: false)
+        expect_hunt_continued
+      end
+
+      it 'does not stop when the setting is disabled, even while bleeding' do
+        run_safety_tick(stop_on_bleeding: false, safety_exit_on_bleeding: false, bleeding: true)
+        expect_hunt_continued
+      end
+
+      it 'does not raise when run standalone without hunting-buddy' do
+        $HUNTING_BUDDY = nil # combat-trainer is often run on its own
+        expect { run_safety_tick(stop_on_bleeding: true, bleeding: true) }.not_to raise_error
         expect($COMBAT_TRAINER).to have_received(:stop)
       end
+    end
 
-      it 'does not stop hunt below default threshold' do
-        instance = build_safety_process(untendable_counter: 2)
-        stub_post_safety(instance)
-        allow(instance).to receive(:bleeding?).and_return(true) # bleeding so the threshold (not the not-bleeding reset) is what is tested
-        game_state = build_game_state
+    # Finding #2: an active heal-over-time (Devour/Heal/Regenerate) tends the bleed for
+    # us, so a bleed alone must NOT end the hunt -- only a bleed *plus* low vitality
+    # (DRStats.health below safety_escape_health_threshold, default 80) should.
+    describe 'stop_hunting_if_bleeding with an active heal-over-time' do
+      %w[Devour Heal Regenerate].each do |hot|
+        it "keeps hunting while #{hot} is active and vitality is healthy" do
+          run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 100, active_spells: { hot => 20 })
+          expect_hunt_continued
+        end
 
-        instance.execute(game_state)
-
-        expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+        it "still stops when #{hot} is active but vitality is below the 80 floor" do
+          run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 50, active_spells: { hot => 20 })
+          expect_hunt_stopped
+        end
       end
 
-      it 'stops hunt at custom threshold of 1' do
-        instance = build_safety_process(safety_untendable_threshold: 1, untendable_counter: 1)
-        stub_post_safety(instance)
-        allow(instance).to receive(:bleeding?).and_return(true) # stop is gated on active bleeding
-        game_state = build_game_state
-
-        instance.execute(game_state)
-
-        expect($HUNTING_BUDDY).to have_received(:stop_hunting)
+      it 'treats multiple simultaneous heal-over-times the same as one' do
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 100,
+                        active_spells: { 'Heal' => 20, 'Regenerate' => 20 })
+        expect_hunt_continued
       end
 
-      it 'requires stop_on_bleeding to be true' do
-        instance = build_safety_process(untendable_counter: 3, stop_on_bleeding: false)
-        stub_post_safety(instance)
-        allow(instance).to receive(:bleeding?).and_return(true) # bleeding so stop_on_bleeding=false is what prevents the stop
-        game_state = build_game_state
+      it 'is not suppressed by an unrelated active spell' do
+        # A random buff must not be mistaken for a heal-over-time.
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 100, active_spells: { 'Heroism' => 20 })
+        expect_hunt_stopped
+      end
 
-        instance.execute(game_state)
+      # Boundary: the gate is `health < threshold`, so exactly-at-threshold keeps hunting.
+      it 'keeps hunting at exactly the 80 vitality floor' do
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 80, active_spells: { 'Heal' => 20 })
+        expect_hunt_continued
+      end
+
+      it 'stops one point below the 80 vitality floor' do
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 79, active_spells: { 'Heal' => 20 })
+        expect_hunt_stopped
+      end
+
+      # A non-thief with a custom safety_escape_health_threshold uses that value as the
+      # floor (the Thief/Vanish branch above is skipped for non-thieves), not the 80 default.
+      it 'honors a custom safety_escape_health_threshold as the floor' do
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 50,
+                        safety_escape_health_threshold: 40, active_spells: { 'Heal' => 20 })
+        expect_hunt_continued # 50 >= 40, HoT keeps up
+
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 39,
+                        safety_escape_health_threshold: 40, active_spells: { 'Heal' => 20 })
+        expect_hunt_stopped # 39 < 40
+      end
+
+      it 'never stops on bleed when the setting is disabled, even at low vitality with a heal-over-time' do
+        run_safety_tick(stop_on_bleeding: false, safety_exit_on_bleeding: false,
+                        bleeding: true, health: 10, active_spells: { 'Heal' => 20 })
+        expect_hunt_continued
+      end
+    end
+
+    # Guards the elsif ordering my new branch sits inside: the ;tendme fallback must
+    # remain reachable when we are NOT stopping, and must be pre-empted when we are.
+    describe 'tend (;tendme) fallback reachability' do
+      it 'attempts to tend bleeders when not stopping and no heal-over-time is active' do
+        allow(DRCH).to receive(:has_tendable_bleeders?).and_return(true)
+        allow(DRC).to receive(:wait_for_script_to_complete)
+
+        run_safety_tick(stop_on_bleeding: false, safety_exit_on_bleeding: false, bleeding: true)
+
+        expect(DRC).to have_received(:wait_for_script_to_complete).with('tendme')
+      end
+
+      it 'does not tend while a heal-over-time is handling the bleed' do
+        allow(DRCH).to receive(:has_tendable_bleeders?).and_return(true)
+        allow(DRC).to receive(:wait_for_script_to_complete)
+
+        # HoT active, vitality healthy: no stop AND no tend -- the HoT owns the bleed.
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 100, active_spells: { 'Heal' => 20 })
+
+        expect(DRC).not_to have_received(:wait_for_script_to_complete)
+        expect_hunt_continued
+      end
+
+      it 'stops instead of tending when stop_on_bleeding pre-empts the fallback' do
+        allow(DRCH).to receive(:has_tendable_bleeders?).and_return(true)
+        allow(DRC).to receive(:wait_for_script_to_complete)
+
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 100)
+
+        expect(DRC).not_to have_received(:wait_for_script_to_complete)
+        expect_hunt_stopped
+      end
+    end
+
+    # Adversarial: my branch must not jump ahead of higher-priority safety branches,
+    # and those branches must still fire in cases where my branch would NOT stop.
+    describe 'stop_hunting_if_bleeding branch precedence' do
+      # Non-theater precedence test: pick the exact state where the bleed branches do
+      # NOT stop (heal-over-time active + healthy vitality). If concentration did not
+      # take precedence / fire independently, nothing would stop the hunt here.
+      it 'still stops for low concentration even when a heal-over-time suppresses the bleed stop' do
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 100,
+                        active_spells: { 'Heal' => 20 },
+                        safety_concentration_minimum: 10, concentration: 5)
+        expect_hunt_stopped
+        expect(displayed_messages).to include(a_string_matching(/Concentration below/))
+      end
+
+      it 'yields to the Thief Vanish escape when bleeding' do
+        DRStats.guild = 'Thief'
+        DRSpells._set_known_spells({ 'Vanish' => true })
+
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, safety_escape_health_threshold: 90)
+
+        expect(DRCA).to have_received(:activate_khri?).with(false, 'Vanish')
+        expect_hunt_stopped
+      end
+
+      it 'lets a Thief Vanish outrank the concentration halt when in danger' do
+        DRStats.guild = 'Thief'
+        DRSpells._set_known_spells({ 'Vanish' => true })
+        # Low concentration AND bleeding: escape (Vanish) should win over the plain halt.
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, safety_escape_health_threshold: 90,
+                        safety_concentration_minimum: 10, concentration: 5)
+
+        expect(DRCA).to have_received(:activate_khri?).with(false, 'Vanish')
+        expect_hunt_stopped
+      end
+
+      it 'still halts a Thief on low concentration alone (no escape-worthy danger)' do
+        DRStats.guild = 'Thief'
+        DRSpells._set_known_spells({ 'Vanish' => true })
+        # Healthy and not bleeding/stunned: should_vanish? is false, so concentration halts.
+        run_safety_tick(safety_escape_health_threshold: 90, safety_concentration_minimum: 10,
+                        concentration: 5, health: 100)
+
+        expect(DRCA).not_to have_received(:activate_khri?)
+        expect_hunt_stopped
+        expect(displayed_messages).to include(a_string_matching(/Concentration below/))
+      end
+    end
+
+    # Once a stop is decided the combat loop runs a multi-tick cleanup; the safety chain must
+    # not keep firing (re-echoing / re-Vanishing) during it, but housekeeping should continue.
+    describe 'during cleanup' do
+      it 'skips the bail-out chain so it does not re-stop each tick' do
+        instance = build_safety_process(stop_on_bleeding: true)
+        stub_post_safety(instance)
+        allow(instance).to receive(:bleeding?).and_return(true)
+
+        instance.execute(build_game_state(cleaning_up?: true))
 
         expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+        expect($COMBAT_TRAINER).not_to have_received(:stop)
+      end
+
+      it 'still runs post-safety housekeeping during cleanup' do
+        instance = build_safety_process(stop_on_bleeding: true)
+        stub_post_safety(instance)
+        allow(instance).to receive(:bleeding?).and_return(true)
+
+        instance.execute(build_game_state(cleaning_up?: true))
+
+        expect(instance).to have_received(:tend_parasite)
+      end
+    end
+
+    # Finding #6: the two stop reasons must be distinguishable in the log -- a plain
+    # bleed vs. a bleed that only stopped because vitality fell under an active HoT.
+    describe 'stop_hunting_if_bleeding echo messages' do
+      it 'names a plain bleed stop' do
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 100)
+        expect(displayed_messages).to include(a_string_matching(/Bleeding\. Stopping hunt/))
+      end
+
+      it 'names the low-vitality-under-heal-over-time stop distinctly' do
+        run_safety_tick(stop_on_bleeding: true, bleeding: true, health: 50, active_spells: { 'Heal' => 20 })
+        expect(displayed_messages).to include(a_string_matching(/vitality below 80 despite an active heal-over-time/))
       end
     end
 
@@ -1879,9 +2242,14 @@ RSpec.describe SafetyProcess do
       end
     end
 
-    describe 'safety_exit_on_bleeding' do
+    # DEPRECATED setting. It historically bundled bleed-stop with the stunned-at-low-health
+    # exit; those are now stop_hunting_if_bleeding and safety_exit_when_stunned. It is still
+    # honored (drives both) and now warns at construction. These cases pin that legacy path.
+    describe 'safety_exit_on_bleeding (deprecated)' do
       it 'stops hunt when bleeding and setting is true' do
-        instance = build_safety_process(safety_exit_on_bleeding: true)
+        # Disable stop_on_bleeding so only safety_exit_on_bleeding can drive the stop --
+        # otherwise this passes even if safety_exit_on_bleeding were ignored.
+        instance = build_safety_process(safety_exit_on_bleeding: true, stop_on_bleeding: false)
         stub_post_safety(instance)
         allow(instance).to receive(:bleeding?).and_return(true)
         game_state = build_game_state
@@ -1889,6 +2257,26 @@ RSpec.describe SafetyProcess do
         instance.execute(game_state)
 
         expect($HUNTING_BUDDY).to have_received(:stop_hunting)
+      end
+
+      # The heal-over-time grace is shared: safety_exit_on_bleeding honors it too, not just
+      # stop_hunting_if_bleeding. stop_on_bleeding is disabled here so only the
+      # safety_exit_on_bleeding path can drive the decision.
+      it 'keeps hunting on a bleed a heal-over-time is tending at healthy vitality' do
+        run_safety_tick(safety_exit_on_bleeding: true, stop_on_bleeding: false,
+                        bleeding: true, health: 100, active_spells: { 'Heal' => 20 })
+        expect_hunt_continued
+      end
+
+      it 'stops on a bleed when a heal-over-time is active but vitality is below the floor' do
+        run_safety_tick(safety_exit_on_bleeding: true, stop_on_bleeding: false,
+                        bleeding: true, health: 50, active_spells: { 'Heal' => 20 })
+        expect_hunt_stopped
+      end
+
+      it 'stops on a bleed with no heal-over-time active' do
+        run_safety_tick(safety_exit_on_bleeding: true, stop_on_bleeding: false, bleeding: true)
+        expect_hunt_stopped
       end
 
       it 'stops hunt when stunned with low health' do
@@ -1916,7 +2304,8 @@ RSpec.describe SafetyProcess do
       end
 
       it 'does not fire when setting is false' do
-        instance = build_safety_process(safety_exit_on_bleeding: false)
+        # stop_on_bleeding also stops on bleeding, so disable it too to isolate this case.
+        instance = build_safety_process(safety_exit_on_bleeding: false, stop_on_bleeding: false)
         stub_post_safety(instance)
         allow(instance).to receive(:bleeding?).and_return(true)
         game_state = build_game_state
@@ -1924,6 +2313,265 @@ RSpec.describe SafetyProcess do
         instance.execute(game_state)
 
         expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+      end
+
+      it 'prints a deprecation notice at construction when set' do
+        allow(DRC).to receive(:message)
+        settings = OpenStruct.new(
+          health_threshold: 20, stop_hunting_if_bleeding: false, safety_exit_on_bleeding: true,
+          safety_exit_when_stunned: false, safety_concentration_minimum: nil, safety_escape_health_threshold: nil
+        )
+
+        SafetyProcess.new(settings, double('EquipmentManager'))
+
+        expect(DRC).to have_received(:message).with(/safety_exit_on_bleeding.*deprecated/)
+      end
+
+      it 'does not warn when the deprecated setting is unset' do
+        allow(DRC).to receive(:message)
+        settings = OpenStruct.new(
+          health_threshold: 20, stop_hunting_if_bleeding: true, safety_exit_on_bleeding: false,
+          safety_exit_when_stunned: false, safety_concentration_minimum: nil, safety_escape_health_threshold: nil
+        )
+
+        SafetyProcess.new(settings, double('EquipmentManager'))
+
+        expect(DRC).not_to have_received(:message).with(/deprecated/)
+      end
+    end
+
+    # REMOVED setting: the untendable tend-failure counter is gone; profiles that still set
+    # safety_untendable_threshold get a one-time notice at construction rather than silence.
+    describe 'safety_untendable_threshold (removed)' do
+      it 'warns that it has been removed when still set' do
+        allow(DRC).to receive(:message)
+        settings = OpenStruct.new(
+          health_threshold: 20, stop_hunting_if_bleeding: true, safety_exit_on_bleeding: false,
+          safety_exit_when_stunned: false, safety_concentration_minimum: nil,
+          safety_escape_health_threshold: nil, safety_untendable_threshold: 1
+        )
+
+        SafetyProcess.new(settings, double('EquipmentManager'))
+
+        expect(DRC).to have_received(:message).with(/safety_untendable_threshold.*removed/)
+      end
+
+      it 'does not warn when it is unset' do
+        allow(DRC).to receive(:message)
+        settings = OpenStruct.new(
+          health_threshold: 20, stop_hunting_if_bleeding: true, safety_exit_on_bleeding: false,
+          safety_exit_when_stunned: false, safety_concentration_minimum: nil, safety_escape_health_threshold: nil
+        )
+
+        SafetyProcess.new(settings, double('EquipmentManager'))
+
+        expect(DRC).not_to have_received(:message).with(/safety_untendable_threshold/)
+      end
+    end
+
+    # The stun half of the old safety_exit_on_bleeding, now its own opt-in. Stun-only:
+    # it must never react to a bleed.
+    describe 'safety_exit_when_stunned' do
+      it 'stops when stunned at low vitality' do
+        run_safety_tick(safety_exit_when_stunned: true, safety_exit_on_bleeding: false,
+                        stop_on_bleeding: false, stunned: true, health: 70)
+        expect_hunt_stopped
+      end
+
+      it 'does not stop when stunned at healthy vitality' do
+        run_safety_tick(safety_exit_when_stunned: true, safety_exit_on_bleeding: false,
+                        stop_on_bleeding: false, stunned: true, health: 95)
+        expect_hunt_continued
+      end
+
+      it 'does not stop on a bleed -- it is a stun-only exit' do
+        run_safety_tick(safety_exit_when_stunned: true, safety_exit_on_bleeding: false,
+                        stop_on_bleeding: false, bleeding: true, stunned: false, health: 50)
+        expect_hunt_continued
+      end
+    end
+
+    # Unit coverage for the extracted bail-out predicates (see #execute). These call the
+    # private predicates directly so each decision is pinned independently of dispatch order.
+    describe 'bail-out predicates' do
+      def predicate(instance, name)
+        instance.send(name)
+      end
+
+      describe '#concentration_too_low?' do
+        it 'is true below the minimum' do
+          instance = build_safety_process(safety_concentration_minimum: 10)
+          DRStats.concentration = 5
+          expect(predicate(instance, :concentration_too_low?)).to be_truthy
+        end
+
+        it 'is false at or above the minimum' do
+          instance = build_safety_process(safety_concentration_minimum: 10)
+          DRStats.concentration = 10
+          expect(predicate(instance, :concentration_too_low?)).to be_falsey
+        end
+
+        it 'is disabled (falsey) when unset' do
+          instance = build_safety_process(safety_concentration_minimum: nil)
+          DRStats.concentration = 0
+          expect(predicate(instance, :concentration_too_low?)).to be_falsey
+        end
+
+        it 'is disabled (falsey) at the default of 0, since concentration is never below 0' do
+          instance = build_safety_process(safety_concentration_minimum: 0)
+          DRStats.concentration = 0
+          expect(predicate(instance, :concentration_too_low?)).to be_falsey
+        end
+      end
+
+      describe '#should_vanish?' do
+        before(:each) do
+          DRStats.guild = 'Thief'
+          DRSpells._set_known_spells({ 'Vanish' => true })
+        end
+
+        it 'is true for a Thief who knows Vanish and is bleeding' do
+          instance = build_safety_process(safety_escape_health_threshold: 90)
+          DRStats.health = 100
+          allow(instance).to receive(:bleeding?).and_return(true)
+          allow(instance).to receive(:stunned?).and_return(false)
+          expect(predicate(instance, :should_vanish?)).to be_truthy
+        end
+
+        it 'is false for a non-Thief' do
+          instance = build_safety_process(safety_escape_health_threshold: 90)
+          DRStats.guild = 'Ranger'
+          DRStats.health = 10
+          allow(instance).to receive(:bleeding?).and_return(true)
+          allow(instance).to receive(:stunned?).and_return(false)
+          expect(predicate(instance, :should_vanish?)).to be_falsey
+        end
+
+        it 'is disabled (falsey) when the threshold is unset' do
+          instance = build_safety_process(safety_escape_health_threshold: nil)
+          DRStats.health = 10
+          allow(instance).to receive(:bleeding?).and_return(true)
+          allow(instance).to receive(:stunned?).and_return(false)
+          expect(predicate(instance, :should_vanish?)).to be_falsey
+        end
+      end
+
+      describe '#stunned_at_low_health?' do
+        it 'is true when safety_exit_when_stunned and stunned below the floor' do
+          instance = build_safety_process(safety_exit_when_stunned: true)
+          DRStats.health = 70
+          allow(instance).to receive(:stunned?).and_return(true)
+          expect(predicate(instance, :stunned_at_low_health?)).to be_truthy
+        end
+
+        it 'is honored via the deprecated safety_exit_on_bleeding too' do
+          instance = build_safety_process(safety_exit_when_stunned: false, safety_exit_on_bleeding: true)
+          DRStats.health = 70
+          allow(instance).to receive(:stunned?).and_return(true)
+          expect(predicate(instance, :stunned_at_low_health?)).to be_truthy
+        end
+
+        it 'is false at healthy vitality' do
+          instance = build_safety_process(safety_exit_when_stunned: true)
+          DRStats.health = 95
+          allow(instance).to receive(:stunned?).and_return(true)
+          expect(predicate(instance, :stunned_at_low_health?)).to be_falsey
+        end
+
+        it 'is false when not stunned' do
+          instance = build_safety_process(safety_exit_when_stunned: true)
+          DRStats.health = 10
+          allow(instance).to receive(:stunned?).and_return(false)
+          expect(predicate(instance, :stunned_at_low_health?)).to be_falsey
+        end
+      end
+
+      # bleeding_stop_reason returns nil (do not stop) or the stop message (stop, with the
+      # wording matching the reason) -- one method covering both the decision and the text.
+      describe '#bleeding_stop_reason' do
+        def bleeding_instance(**overrides)
+          instance = build_safety_process(**overrides)
+          allow(instance).to receive(:bleeding?).and_return(true)
+          instance
+        end
+
+        it 'is nil when no bleed-stop setting is enabled' do
+          instance = bleeding_instance(stop_on_bleeding: false, safety_exit_on_bleeding: false)
+          expect(predicate(instance, :bleeding_stop_reason)).to be_nil
+        end
+
+        it 'is nil when not bleeding' do
+          instance = build_safety_process(stop_on_bleeding: true)
+          allow(instance).to receive(:bleeding?).and_return(false)
+          expect(predicate(instance, :bleeding_stop_reason)).to be_nil
+        end
+
+        it 'is a plain-bleed message when bleeding with no heal-over-time' do
+          instance = bleeding_instance(stop_on_bleeding: true)
+          DRSpells._set_active_spells({})
+          expect(predicate(instance, :bleeding_stop_reason)).to match(/^Bleeding\. Stopping hunt/)
+        end
+
+        it 'is nil when a heal-over-time is tending at healthy vitality' do
+          instance = bleeding_instance(stop_on_bleeding: true)
+          DRStats.health = 100
+          DRSpells._set_active_spells({ 'Heal' => 20 })
+          expect(predicate(instance, :bleeding_stop_reason)).to be_nil
+        end
+
+        it 'is the low-vitality message when a heal-over-time is active but vitality is below the floor' do
+          instance = bleeding_instance(stop_on_bleeding: true)
+          DRStats.health = 50
+          DRSpells._set_active_spells({ 'Heal' => 20 })
+          expect(predicate(instance, :bleeding_stop_reason)).to match(/despite an active heal-over-time/)
+        end
+      end
+
+      describe '#tend_bleeders?' do
+        it 'is true when bleeding, tendme not running, and no heal-over-time' do
+          instance = build_safety_process
+          allow(instance).to receive(:bleeding?).and_return(true)
+          DRSpells._set_active_spells({})
+          expect(predicate(instance, :tend_bleeders?)).to be_truthy
+        end
+
+        it 'is false while a heal-over-time is active' do
+          instance = build_safety_process
+          allow(instance).to receive(:bleeding?).and_return(true)
+          DRSpells._set_active_spells({ 'Heal' => 20 })
+          expect(predicate(instance, :tend_bleeders?)).to be_falsey
+        end
+
+        it 'is false while tendme is already running' do
+          instance = build_safety_process
+          allow(instance).to receive(:bleeding?).and_return(true)
+          DRSpells._set_active_spells({})
+          $running_scripts << 'tendme'
+          expect(predicate(instance, :tend_bleeders?)).to be_falsey
+        end
+      end
+
+      describe '#stop_hunt' do
+        it 'echoes the reason and stops both hunt and combat-trainer' do
+          instance = build_safety_process
+          instance.send(:stop_hunt, 'Reason here.')
+          expect(displayed_messages).to include('Reason here.')
+          expect($HUNTING_BUDDY).to have_received(:stop_hunting)
+          expect($COMBAT_TRAINER).to have_received(:stop)
+        end
+
+        it 'stops without echoing when no message is given' do
+          instance = build_safety_process
+          instance.send(:stop_hunt)
+          expect($COMBAT_TRAINER).to have_received(:stop)
+        end
+
+        it 'does not raise when run standalone (nil hunting-buddy)' do
+          $HUNTING_BUDDY = nil
+          instance = build_safety_process
+          expect { instance.send(:stop_hunt, 'x') }.not_to raise_error
+          expect($COMBAT_TRAINER).to have_received(:stop)
+        end
       end
     end
   end
@@ -1948,9 +2596,8 @@ RSpec.describe AbilityProcess do
   describe '#discover_egg' do
     it 'records the game ID when egg is found' do
       instance = build_ability_process
-      stub_right_hand_with_id('12345')
-      allow(DRCI).to receive(:get_item?).with('egg').and_return(true)
-      allow(DRCI).to receive(:stow_item?).and_return(true)
+      hands = stub_hands
+      allow(DRCI).to receive(:get_item?).with('egg') { take_into_hand(hands, '12345', 'egg') }
 
       instance.send(:discover_egg, 'egg')
 
@@ -1959,13 +2606,97 @@ RSpec.describe AbilityProcess do
 
     it 'stows by game ID after discovery' do
       instance = build_ability_process
-      stub_right_hand_with_id('12345')
-      allow(DRCI).to receive(:get_item?).with('egg').and_return(true)
-      allow(DRCI).to receive(:stow_item?).and_return(true)
+      hands = stub_hands
+      allow(DRCI).to receive(:get_item?).with('egg') { take_into_hand(hands, '12345', 'egg') }
 
       instance.send(:discover_egg, 'egg')
 
       expect(DRCI).to have_received(:stow_item?).with('#12345')
+    end
+
+    # Alexzander, 2026-09-29 03:20:01: a traveler's pack (#120784424) filled
+    # the right hand, "get my egg" put the egg in the left hand, and the pack's
+    # ID was recorded as the egg. Every later "invoke #120784424" answered "You
+    # hold the traveler's pack..." and timed out after 15s (291 times that day).
+    context 'when the right hand is already holding something' do
+      it 'records the egg that landed in the left hand' do
+        instance = build_ability_process
+        hands = stub_hands(right: ['120784424', "traveler's pack"])
+        allow(DRCI).to receive(:get_item?).with('egg') { take_into_hand(hands, '116118694', 'glass egg') }
+
+        instance.send(:discover_egg, 'egg')
+
+        expect(instance.instance_variable_get(:@egg_ids)).to eq(['116118694'])
+      end
+
+      it 'stows the egg, not the right-hand item' do
+        instance = build_ability_process
+        hands = stub_hands(right: ['120784424', "traveler's pack"])
+        allow(DRCI).to receive(:get_item?).with('egg') { take_into_hand(hands, '116118694', 'glass egg') }
+
+        instance.send(:discover_egg, 'egg')
+
+        expect(DRCI).to have_received(:stow_item?).with('#116118694')
+      end
+    end
+
+    context 'when the egg is already in hand ("You are already holding that")' do
+      it 'records the held egg' do
+        instance = build_ability_process
+        stub_hands(right: ['120784424', 'pack'], left: ['116118694', 'egg'])
+        allow(DRCI).to receive(:get_item?).with('egg').and_return(true)
+
+        instance.send(:discover_egg, 'egg')
+
+        expect(instance.instance_variable_get(:@egg_ids)).to eq(['116118694'])
+      end
+
+      it 'recognizes the second egg by its noun, not by the ordinal' do
+        instance = build_ability_process(egg_ids: ['116118694']) # first egg already stowed
+        stub_hands(left: ['130000001', 'egg'])
+        allow(DRCI).to receive(:get_item?).with('second egg').and_return(true)
+
+        instance.send(:discover_egg, 'second egg')
+
+        expect(instance.instance_variable_get(:@egg_ids)).to eq(%w[116118694 130000001])
+      end
+    end
+
+    # A character with no STOW container keeps its first egg in hand, and
+    # DRCI.get_item? reports success whenever an egg is in hand -- even when
+    # "get my second egg" found nothing.
+    context 'when the first egg is still in hand and the second get finds nothing' do
+      it 'does not record the first egg twice' do
+        instance = build_ability_process(egg_ids: ['116118694'])
+        stub_hands(right: ['116118694', 'egg'])
+        allow(DRCI).to receive(:get_item?).with('second egg').and_return(true)
+
+        instance.send(:discover_egg, 'second egg')
+
+        expect(instance.instance_variable_get(:@egg_ids)).to eq(['116118694'])
+      end
+
+      it 'warns that the second egg was not found' do
+        instance = build_ability_process(egg_ids: ['116118694'])
+        stub_hands(right: ['116118694', 'egg'])
+        allow(DRCI).to receive(:get_item?).with('second egg').and_return(true)
+
+        instance.send(:discover_egg, 'second egg')
+
+        expect(DRC).to have_received(:message).with(/Could not find 'second egg'/)
+      end
+    end
+
+    context 'when the second egg lands beside a first egg still in hand' do
+      it 'records the second egg' do
+        instance = build_ability_process(egg_ids: ['116118694'])
+        hands = stub_hands(right: ['116118694', 'egg'])
+        allow(DRCI).to receive(:get_item?).with('second egg') { take_into_hand(hands, '130000001', 'egg') }
+
+        instance.send(:discover_egg, 'second egg')
+
+        expect(instance.instance_variable_get(:@egg_ids)).to eq(%w[116118694 130000001])
+      end
     end
 
     it 'warns and does not record when egg is not found' do
@@ -1985,9 +2716,8 @@ RSpec.describe AbilityProcess do
   describe '#discover_warhorn' do
     it 'records worn warhorn when remove succeeds' do
       instance = build_ability_process
-      stub_right_hand_with_id('99')
-      allow(DRCI).to receive(:remove_item?).with('warhorn').and_return(true)
-      allow(DRCI).to receive(:wear_item?).and_return(true)
+      hands = stub_hands
+      allow(DRCI).to receive(:remove_item?).with('warhorn') { take_into_hand(hands, '99', 'warhorn') }
 
       instance.send(:discover_warhorn, 'warhorn')
 
@@ -1997,9 +2727,8 @@ RSpec.describe AbilityProcess do
 
     it 're-wears a worn warhorn after discovery' do
       instance = build_ability_process
-      stub_right_hand_with_id('99')
-      allow(DRCI).to receive(:remove_item?).with('warhorn').and_return(true)
-      allow(DRCI).to receive(:wear_item?).and_return(true)
+      hands = stub_hands
+      allow(DRCI).to receive(:remove_item?).with('warhorn') { take_into_hand(hands, '99', 'warhorn') }
 
       instance.send(:discover_warhorn, 'warhorn')
 
@@ -2008,15 +2737,114 @@ RSpec.describe AbilityProcess do
 
     it 'records stowed warhorn when remove fails but get succeeds' do
       instance = build_ability_process
-      stub_right_hand_with_id('50')
+      hands = stub_hands
       allow(DRCI).to receive(:remove_item?).with('horn').and_return(false)
-      allow(DRCI).to receive(:get_item?).with('horn').and_return(true)
-      allow(DRCI).to receive(:stow_item?).and_return(true)
+      allow(DRCI).to receive(:get_item?).with('horn') { take_into_hand(hands, '50', 'horn') }
 
       instance.send(:discover_warhorn, 'horn')
 
       items = instance.instance_variable_get(:@warhorn_items)
       expect(items).to eq([{ id: '50', worn: false }])
+    end
+
+    context 'when the right hand is already holding something' do
+      it 'records a removed warhorn that landed in the left hand' do
+        instance = build_ability_process
+        hands = stub_hands(right: ['120784424', "traveler's pack"])
+        allow(DRCI).to receive(:remove_item?).with('warhorn') { take_into_hand(hands, '116110152', 'mammoth-tusk warhorn') }
+
+        instance.send(:discover_warhorn, 'warhorn')
+
+        expect(instance.instance_variable_get(:@warhorn_items)).to eq([{ id: '116110152', worn: true }])
+      end
+
+      it 're-wears the warhorn, not the right-hand item' do
+        instance = build_ability_process
+        hands = stub_hands(right: ['120784424', "traveler's pack"])
+        allow(DRCI).to receive(:remove_item?).with('warhorn') { take_into_hand(hands, '116110152', 'mammoth-tusk warhorn') }
+
+        instance.send(:discover_warhorn, 'warhorn')
+
+        expect(DRCI).to have_received(:wear_item?).with('#116110152')
+      end
+
+      # In game, 2026-09-29: "You get a mammoth tusk warhorn gilded with gold
+      # flames ..." -> GameObj.left_hand.name "mammoth-tusk warhorn".
+      it "finds the warhorn by the noun in its hand name" do
+        instance = build_ability_process
+        hands = stub_hands(right: ['120784424', "traveler's pack"])
+        allow(DRCI).to receive(:remove_item?).with('warhorn') { take_into_hand(hands, '122645043', 'mammoth-tusk warhorn') }
+
+        instance.send(:discover_warhorn, 'warhorn')
+
+        expect(instance.instance_variable_get(:@warhorn_items)).to eq([{ id: '122645043', worn: true }])
+      end
+
+      it 'finds the warhorn by a shortened noun, as the game allows' do
+        instance = build_ability_process
+        hands = stub_hands(right: ['120784424', "traveler's pack"])
+        allow(DRCI).to receive(:remove_item?).with('warh') { take_into_hand(hands, '122645043', 'mammoth-tusk warhorn') }
+
+        instance.send(:discover_warhorn, 'warh')
+
+        expect(instance.instance_variable_get(:@warhorn_items)).to eq([{ id: '122645043', worn: true }])
+      end
+
+      # The game matches nouns by prefix only: "horn" never names a warhorn.
+      it 'does not take a warhorn in the other hand for a configured "horn"' do
+        instance = build_ability_process
+        hands = stub_hands(right: ['122645043', 'mammoth-tusk warhorn'])
+        allow(DRCI).to receive(:remove_item?).with('horn') { take_into_hand(hands, '140000001', "ram's horn") }
+
+        instance.send(:discover_warhorn, 'horn')
+
+        expect(instance.instance_variable_get(:@warhorn_items)).to eq([{ id: '140000001', worn: true }])
+      end
+
+      # e.g. combat-trainer restarted after dying mid-exhale: "remove my
+      # warhorn" -> "Remove what?", "get my warhorn" -> "You are already
+      # holding that".
+      it 'records a warhorn already in hand as stowed, not worn, when remove fails' do
+        instance = build_ability_process
+        stub_hands(right: ['120784424', "traveler's pack"], left: ['122645043', 'mammoth-tusk warhorn'])
+        allow(DRCI).to receive(:remove_item?).with('warhorn').and_return(false)
+        allow(DRCI).to receive(:get_item?).with('warhorn').and_return(true)
+
+        instance.send(:discover_warhorn, 'warhorn')
+
+        expect(instance.instance_variable_get(:@warhorn_items)).to eq([{ id: '122645043', worn: false }])
+      end
+
+      it 'matches an adjective + noun warhorn name by its noun' do
+        instance = build_ability_process
+        hands = stub_hands(right: ['120784424', "traveler's pack"])
+        allow(DRCI).to receive(:remove_item?).with('kertig warhorn') { take_into_hand(hands, '116110152', 'mammoth-tusk warhorn') }
+
+        instance.send(:discover_warhorn, 'kertig warhorn')
+
+        expect(instance.instance_variable_get(:@warhorn_items)).to eq([{ id: '116110152', worn: true }])
+      end
+
+      it 'matches the noun regardless of how the name is capitalized' do
+        instance = build_ability_process
+        hands = stub_hands(right: ['120784424', "traveler's pack"])
+        allow(DRCI).to receive(:remove_item?).with('Warhorn') { take_into_hand(hands, '116110152', 'mammoth-tusk warhorn') }
+
+        instance.send(:discover_warhorn, 'Warhorn')
+
+        expect(instance.instance_variable_get(:@warhorn_items)).to eq([{ id: '116110152', worn: true }])
+      end
+
+      it 'records a fetched warhorn that landed in the left hand' do
+        instance = build_ability_process
+        hands = stub_hands(right: ['120784424', "traveler's pack"])
+        allow(DRCI).to receive(:remove_item?).with('warhorn').and_return(false)
+        allow(DRCI).to receive(:get_item?).with('warhorn') { take_into_hand(hands, '116110152', 'mammoth-tusk warhorn') }
+
+        instance.send(:discover_warhorn, 'warhorn')
+
+        expect(instance.instance_variable_get(:@warhorn_items)).to eq([{ id: '116110152', worn: false }])
+      end
     end
 
     it 'warns when warhorn is not found at all' do
@@ -2037,11 +2865,9 @@ RSpec.describe AbilityProcess do
   describe '#set_warhorn_or_egg' do
     it 'builds rotation with both egg and warhorn when both are found' do
       instance = build_ability_process(egg_count: 1, warhorn_nouns: ['warhorn'])
-      stub_right_hand_with_id('10')
-      allow(DRCI).to receive(:get_item?).and_return(true)
-      allow(DRCI).to receive(:stow_item?).and_return(true)
-      allow(DRCI).to receive(:remove_item?).and_return(true)
-      allow(DRCI).to receive(:wear_item?).and_return(true)
+      hands = stub_hands
+      allow(DRCI).to receive(:get_item?).with('egg') { take_into_hand(hands, '10', 'egg') }
+      allow(DRCI).to receive(:remove_item?).with('warhorn') { take_into_hand(hands, '11', 'warhorn') }
 
       instance.send(:set_warhorn_or_egg)
 
@@ -2050,9 +2876,8 @@ RSpec.describe AbilityProcess do
 
     it 'builds rotation with only egg when no warhorns configured' do
       instance = build_ability_process(egg_count: 1, warhorn_nouns: [])
-      stub_right_hand_with_id('10')
-      allow(DRCI).to receive(:get_item?).and_return(true)
-      allow(DRCI).to receive(:stow_item?).and_return(true)
+      hands = stub_hands
+      allow(DRCI).to receive(:get_item?).with('egg') { take_into_hand(hands, '10', 'egg') }
 
       instance.send(:set_warhorn_or_egg)
 
@@ -2071,18 +2896,10 @@ RSpec.describe AbilityProcess do
     end
 
     it 'warns when fewer eggs found than configured' do
-      call_count = 0
       instance = build_ability_process(egg_count: 2, warhorn_nouns: [])
-      allow(DRCI).to receive(:get_item?) do |_arg|
-        call_count += 1
-        if call_count == 1
-          stub_right_hand_with_id('10')
-          true
-        else
-          false
-        end
-      end
-      allow(DRCI).to receive(:stow_item?).and_return(true)
+      hands = stub_hands
+      allow(DRCI).to receive(:get_item?).with('egg') { take_into_hand(hands, '10', 'egg') }
+      allow(DRCI).to receive(:get_item?).with('second egg').and_return(false)
 
       instance.send(:set_warhorn_or_egg)
 
@@ -2599,9 +3416,8 @@ RSpec.describe AbilityProcess do
     describe 'set_warhorn_or_egg with degenerate configs' do
       it 'handles egg_count 0 with warhorn_nouns present (warhorn only)' do
         instance = build_ability_process(egg_count: 0, warhorn_nouns: ['warhorn'])
-        stub_right_hand_with_id('10')
-        allow(DRCI).to receive(:remove_item?).and_return(true)
-        allow(DRCI).to receive(:wear_item?).and_return(true)
+        hands = stub_hands
+        allow(DRCI).to receive(:remove_item?).with('warhorn') { take_into_hand(hands, '10', 'warhorn') }
 
         instance.send(:set_warhorn_or_egg)
 
@@ -2622,13 +3438,12 @@ RSpec.describe AbilityProcess do
 
       it 'handles egg_count 3 (only discovers first 2, skips unsupported ordinal)' do
         instance = build_ability_process(egg_count: 3, warhorn_nouns: [])
+        hands = stub_hands
         call_count = 0
-        allow(DRCI).to receive(:get_item?) do |_arg|
+        allow(DRCI).to receive(:get_item?) do |_ordinal|
           call_count += 1
-          stub_right_hand_with_id("e#{call_count}")
-          true
+          take_into_hand(hands, "e#{call_count}", 'egg')
         end
-        allow(DRCI).to receive(:stow_item?).and_return(true)
 
         instance.send(:set_warhorn_or_egg)
 
@@ -2639,9 +3454,8 @@ RSpec.describe AbilityProcess do
 
       it 'handles empty warhorn_nouns array (no discovery attempted)' do
         instance = build_ability_process(egg_count: 1, warhorn_nouns: [])
-        stub_right_hand_with_id('10')
-        allow(DRCI).to receive(:get_item?).and_return(true)
-        allow(DRCI).to receive(:stow_item?).and_return(true)
+        hands = stub_hands
+        allow(DRCI).to receive(:get_item?).with('egg') { take_into_hand(hands, '10', 'egg') }
 
         instance.send(:set_warhorn_or_egg)
 
@@ -2804,7 +3618,11 @@ RSpec.describe SpellProcess do
     defaults = {
       tk_spell: { 'abbrev' => 'tkt', 'slivers' => true },
       tk_ammo: nil,
-      settings: OpenStruct.new
+      settings: OpenStruct.new,
+      # Sliver-recreation throttle. Default the timer well into the past so the
+      # cooldown is elapsed for tests that are not specifically about throttling.
+      sliver_recast_delay: 180,
+      sliver_timer: Time.now - 1000
     }
     defaults.merge(overrides).each do |k, v|
       instance.instance_variable_set(:"@#{k}", v)
@@ -2903,7 +3721,9 @@ RSpec.describe SpellProcess do
     context 'when slivers need to be created' do
       before(:each) do
         setup_moon_mage_with_moonblade
-        allow(DRCA).to receive(:cast_spell)
+        # A successful cast is a precondition for breaking a fresh moonblade;
+        # the failed-cast behavior is covered in its own context below.
+        allow(DRCA).to receive(:cast_spell).and_return(true)
       end
 
       it 'casts moonblade and breaks it on success' do
@@ -2972,6 +3792,85 @@ RSpec.describe SpellProcess do
       end
     end
 
+    # Issue 2 regression: `break moonblade` must be gated on the Moonblade cast
+    # actually succeeding. A failed snap-cast (the character lacks the skill to
+    # complete the pattern at minimum prep) creates no fresh blade, so an
+    # unconditional break would shatter the moonblade already in hand -- the
+    # wielded weapon of a moonblade melee trainer -- leaving them unarmed.
+    context 'when the moonblade cast fails' do
+      before(:each) do
+        setup_moon_mage_with_moonblade
+        allow(DRC).to receive(:message)
+        # Make DRC.bput a spy so `have_received(:bput)` negative assertions work;
+        # examples that need a specific break result re-stub the matching args.
+        allow(DRC).to receive(:bput)
+      end
+
+      it 'never breaks a moonblade when the cast fails (would destroy the wielded weapon)' do
+        allow(DRCA).to receive(:cast_spell).and_return(false)
+
+        instance = build_spell_process
+        game_state = build_game_state
+
+        expect(DRC).not_to receive(:bput).with('break moonblade', anything, anything, anything)
+        instance.send(:check_slivers, game_state)
+      end
+
+      it 'retries the cast up to 3 times but never breaks' do
+        allow(DRCA).to receive(:cast_spell).and_return(false)
+
+        instance = build_spell_process
+        game_state = build_game_state
+
+        instance.send(:check_slivers, game_state)
+
+        expect(DRCA).to have_received(:cast_spell).exactly(3).times
+        expect(DRC).not_to have_received(:bput).with('break moonblade', anything, anything, anything)
+      end
+
+      it 'logs the failure message when every cast fails' do
+        allow(DRCA).to receive(:cast_spell).and_return(false)
+
+        instance = build_spell_process
+        game_state = build_game_state
+
+        expect(DRC).to receive(:message).with(/Failed to create slivers.*3 attempts/)
+        instance.send(:check_slivers, game_state)
+      end
+
+      it 'breaks only after a cast finally succeeds (fail, fail, then succeed)' do
+        allow(DRCA).to receive(:cast_spell).and_return(false, false, true)
+        allow(DRC).to receive(:bput)
+          .with('break moonblade', 'The slivers drift about', 'dissipate without any benefit', 'Break what?')
+          .and_return('The slivers drift about')
+
+        instance = build_spell_process
+        game_state = build_game_state
+
+        instance.send(:check_slivers, game_state)
+
+        expect(DRCA).to have_received(:cast_spell).exactly(3).times
+        expect(DRC).to have_received(:bput).with('break moonblade', anything, anything, anything).once
+      end
+
+      it 'breaks only on the successful cast, not on a later failed one' do
+        # cast succeeds first -> break attempted but yields no slivers -> retry;
+        # the next two casts FAIL -> must NOT break again on those.
+        allow(DRCA).to receive(:cast_spell).and_return(true, false, false)
+        allow(DRC).to receive(:bput)
+          .with('break moonblade', 'The slivers drift about', 'dissipate without any benefit', 'Break what?')
+          .and_return('dissipate without any benefit')
+
+        instance = build_spell_process
+        game_state = build_game_state
+
+        instance.send(:check_slivers, game_state)
+
+        expect(DRCA).to have_received(:cast_spell).exactly(3).times
+        expect(DRC).to have_received(:bput).with('break moonblade', anything, anything, anything).once
+      end
+    end
+
     context 'prep time based on Lunar Magic rank' do
       before(:each) do
         setup_moon_mage_with_moonblade
@@ -2980,23 +3879,9 @@ RSpec.describe SpellProcess do
           .and_return('The slivers drift about')
       end
 
-      it 'uses prep_time 1 for Lunar Magic >= 400' do
+      it 'uses prep_time 2 for Lunar Magic >= 400' do
         DRSkill._set_rank('Lunar Magic', 450)
-        allow(DRCA).to receive(:cast_spell)
-
-        instance = build_spell_process
-        game_state = build_game_state
-
-        instance.send(:check_slivers, game_state)
-
-        expect(DRCA).to have_received(:cast_spell) do |spell_data, _settings|
-          expect(spell_data['prep_time']).to eq(1)
-        end
-      end
-
-      it 'uses prep_time 2 for Lunar Magic 300-399' do
-        DRSkill._set_rank('Lunar Magic', 350)
-        allow(DRCA).to receive(:cast_spell)
+        allow(DRCA).to receive(:cast_spell).and_return(true)
 
         instance = build_spell_process
         game_state = build_game_state
@@ -3008,9 +3893,9 @@ RSpec.describe SpellProcess do
         end
       end
 
-      it 'uses prep_time 3 for Lunar Magic 200-299' do
-        DRSkill._set_rank('Lunar Magic', 250)
-        allow(DRCA).to receive(:cast_spell)
+      it 'uses prep_time 3 for Lunar Magic 300-399' do
+        DRSkill._set_rank('Lunar Magic', 350)
+        allow(DRCA).to receive(:cast_spell).and_return(true)
 
         instance = build_spell_process
         game_state = build_game_state
@@ -3022,9 +3907,23 @@ RSpec.describe SpellProcess do
         end
       end
 
+      it 'uses prep_time 4 for Lunar Magic 200-299' do
+        DRSkill._set_rank('Lunar Magic', 250)
+        allow(DRCA).to receive(:cast_spell).and_return(true)
+
+        instance = build_spell_process
+        game_state = build_game_state
+
+        instance.send(:check_slivers, game_state)
+
+        expect(DRCA).to have_received(:cast_spell) do |spell_data, _settings|
+          expect(spell_data['prep_time']).to eq(4)
+        end
+      end
+
       it 'does not override prep_time for Lunar Magic < 200' do
         DRSkill._set_rank('Lunar Magic', 150)
-        allow(DRCA).to receive(:cast_spell)
+        allow(DRCA).to receive(:cast_spell).and_return(true)
 
         instance = build_spell_process
         game_state = build_game_state
@@ -3036,6 +3935,624 @@ RSpec.describe SpellProcess do
           expect(spell_data['prep_time']).to eq(5)
         end
       end
+    end
+
+    # sliver_recast_delay throttle: at most one sliver re-creation attempt per
+    # delay window (default 180s, user-configurable; 0 disables). Prevents
+    # spamming Moonblade casts on targets that consume slivers quickly.
+    context 'sliver recast throttle' do
+      before(:each) do
+        setup_moon_mage_with_moonblade
+        allow(DRC).to receive(:bput)
+          .with('break moonblade', anything, anything, anything)
+          .and_return('The slivers drift about')
+      end
+
+      it 'does not cast again while still within the cooldown window' do
+        instance = build_spell_process(sliver_recast_delay: 180, sliver_timer: Time.now - 30)
+
+        expect(DRCA).not_to receive(:cast_spell)
+        instance.send(:check_slivers, build_game_state)
+      end
+
+      it 'casts once the cooldown window has elapsed' do
+        allow(DRCA).to receive(:cast_spell).and_return(true)
+
+        instance = build_spell_process(sliver_recast_delay: 180, sliver_timer: Time.now - 181)
+        instance.send(:check_slivers, build_game_state)
+
+        expect(DRCA).to have_received(:cast_spell)
+      end
+
+      it 'boundary: still throttled one second before the delay elapses' do
+        instance = build_spell_process(sliver_recast_delay: 100, sliver_timer: Time.now - 99)
+
+        expect(DRCA).not_to receive(:cast_spell)
+        instance.send(:check_slivers, build_game_state)
+      end
+
+      it 'respects a custom (shorter) delay that a default 180 would still block' do
+        allow(DRCA).to receive(:cast_spell).and_return(true)
+
+        # 30s since last attempt: blocked at the 180 default, allowed at 20s.
+        instance = build_spell_process(sliver_recast_delay: 20, sliver_timer: Time.now - 30)
+        instance.send(:check_slivers, build_game_state)
+
+        expect(DRCA).to have_received(:cast_spell)
+      end
+
+      it 'a delay of 0 disables the throttle entirely' do
+        allow(DRCA).to receive(:cast_spell).and_return(true)
+
+        instance = build_spell_process(sliver_recast_delay: 0, sliver_timer: Time.now)
+        instance.send(:check_slivers, build_game_state)
+
+        expect(DRCA).to have_received(:cast_spell)
+      end
+
+      it 'starts the cooldown on an attempt so an immediate second call is throttled' do
+        allow(DRCA).to receive(:cast_spell).and_return(true)
+
+        instance = build_spell_process(sliver_recast_delay: 180, sliver_timer: Time.now - 1000)
+        game_state = build_game_state
+
+        instance.send(:check_slivers, game_state) # attempt: sets the timer
+        instance.send(:check_slivers, game_state) # immediately after: throttled
+
+        expect(DRCA).to have_received(:cast_spell).once
+      end
+
+      it 'starts the cooldown even when every cast fails (no per-tick retry spam)' do
+        allow(DRC).to receive(:message)
+        allow(DRCA).to receive(:cast_spell).and_return(false)
+
+        instance = build_spell_process(sliver_recast_delay: 180, sliver_timer: Time.now - 1000)
+        game_state = build_game_state
+
+        instance.send(:check_slivers, game_state) # 3 failed casts, sets the timer
+        instance.send(:check_slivers, game_state) # throttled: no new casts
+
+        expect(DRCA).to have_received(:cast_spell).exactly(3).times
+      end
+
+      it 'does not start the cooldown when no moons are visible (retries next tick)' do
+        UserVars._set_moons({ 'visible' => [] })
+
+        instance = build_spell_process(sliver_recast_delay: 180, sliver_timer: Time.now - 1000)
+        instance.send(:check_slivers, build_game_state)
+
+        # timer stays in the past so a later tick (with moons up) can still attempt
+        expect(instance.instance_variable_get(:@sliver_timer)).to be <= (Time.now - 1000)
+      end
+    end
+  end
+
+  # cast_ritual now routes weapon disposition through the summoned-aware
+  # GameState helpers (stow_or_store_weapon / restore_weapon) instead of its
+  # own inline break/stow + re-summon/wield branching.
+  describe '#cast_ritual' do
+    it 'stores the weapon before the ritual and restores it after' do
+      allow(DRCMM).to receive(:update_astral_data).and_return(nil)
+      instance = build_spell_process
+      gs = double('GameState')
+      allow(gs).to receive(:reset_stance=)
+      expect(gs).to receive(:stow_or_store_weapon).ordered
+      expect(gs).to receive(:restore_weapon).ordered
+      instance.send(:cast_ritual, { 'ritual' => true }, gs)
+    end
+
+    it 'performs the ritual (invoke + DRCA.ritual) when astral data is present' do
+      data = { 'ritual' => true, 'abbrev' => 'foo' }
+      allow(DRCMM).to receive(:update_astral_data).and_return(data)
+      allow(DRCA).to receive(:ritual)
+      instance = build_spell_process
+      allow(instance).to receive(:check_invoke)
+      gs = double('GameState', stow_or_store_weapon: nil, restore_weapon: nil)
+      allow(gs).to receive(:reset_stance=)
+
+      instance.send(:cast_ritual, data, gs)
+
+      expect(gs).to have_received(:stow_or_store_weapon)
+      expect(instance).to have_received(:check_invoke)
+      expect(DRCA).to have_received(:ritual).with(data, anything)
+      expect(gs).to have_received(:restore_weapon)
+    end
+
+    it 'skips the ritual body but still restores the weapon when astral data is nil' do
+      allow(DRCMM).to receive(:update_astral_data).and_return(nil)
+      allow(DRCA).to receive(:ritual)
+      instance = build_spell_process
+      allow(instance).to receive(:check_invoke)
+      gs = double('GameState', stow_or_store_weapon: nil, restore_weapon: nil)
+      allow(gs).to receive(:reset_stance=)
+
+      instance.send(:cast_ritual, { 'ritual' => true }, gs)
+
+      expect(instance).not_to have_received(:check_invoke)
+      expect(DRCA).not_to have_received(:ritual)
+      expect(gs).to have_received(:restore_weapon)
+    end
+
+    it 'resets stance after the ritual' do
+      allow(DRCMM).to receive(:update_astral_data).and_return(nil)
+      instance = build_spell_process
+      gs = double('GameState', stow_or_store_weapon: nil, restore_weapon: nil)
+      expect(gs).to receive(:reset_stance=).with(true)
+      instance.send(:cast_ritual, { 'ritual' => true }, gs)
+    end
+  end
+
+  # ===========================================================================
+  # Failed spell prep must not leave the character wedged (issue #7563).
+  #
+  # DRCA.prepare? returns false when preparation fails (unknown spell, area
+  # interference, exhausted retries, ...). The original bug discarded that value
+  # and set game_state.casting = true unconditionally, so #execute bailed on
+  # `if game_state.casting` and starved all offensive/training casting until
+  # check_timer cleared it 70s later. These specs also cover the follow-up work:
+  # disabling genuinely-unknown spells (by abbrev, centrally in prepare_spell so
+  # every caller is covered) and fully resetting casting state on the abort path.
+  # ===========================================================================
+  describe '#prepare_spell' do
+    def build_prep_state(**attrs)
+      gs = GameState.allocate
+      { casting: false, cast_timer: nil }.merge(attrs).each { |k, v| gs.send(:"#{k}=", v) }
+      gs
+    end
+
+    it 'sets casting when preparation succeeds' do
+      allow(DRCA).to receive(:prepare?).and_return('You feel fully prepared to cast your spell.')
+
+      instance = build_spell_process
+      gs = build_prep_state
+      data = { 'abbrev' => 'FIRE', 'name' => 'Fire Spirit', 'mana' => 3, 'cambrinth' => [] }
+
+      instance.send(:prepare_spell, data, gs)
+
+      expect(gs.casting).to be true
+    end
+
+    it 'leaves casting unset AND does not disable the spell on a transient failure' do
+      # prepare? returns false but the unknown-spell flag never trips (e.g. area
+      # interference). We must recover WITHOUT permanently disabling a castable
+      # spell -- disabling is reserved for the specific "no idea how to cast" line.
+      allow(DRCA).to receive(:prepare?).and_return(false)
+
+      instance = build_spell_process
+      gs = build_prep_state
+      data = { 'abbrev' => 'FIRE', 'name' => 'Fire Spirit', 'mana' => 3 }
+
+      instance.send(:prepare_spell, data, gs)
+
+      expect(gs.casting).to be false
+      expect(gs.cast_timer).to be_nil
+      expect(instance.send(:spell_disabled?, 'fire')).to be false
+    end
+
+    it 'disables an unknown spell, announces it once, and does not set casting' do
+      # Mimic the game replying "You have no idea how to cast that spell".
+      allow(DRCA).to receive(:prepare?) do
+        Flags['ct-spell-unknown'] = true
+        false
+      end
+      allow(DRC).to receive(:message)
+
+      instance = build_spell_process
+      gs = build_prep_state
+      data = { 'abbrev' => 'EASE', 'name' => 'Ease Burden', 'mana' => 3 }
+
+      instance.send(:prepare_spell, data, gs)
+
+      expect(instance.send(:spell_disabled?, 'ease')).to be true
+      expect(gs.casting).to be false
+      expect(DRC).to have_received(:message).once
+    end
+
+    it 'short-circuits a disabled spell before pinging the game or firing prep side-effects' do
+      # Central guard: a disabled spell must not re-send `prep` (DRCA.prepare?) or
+      # run destructive prep side-effects (release_cyclics) -- even a cyclic one.
+      instance = build_spell_process(disabled_spells: Set.new(['leth']))
+      gs = build_prep_state
+      data = { 'abbrev' => 'LETH', 'name' => 'Lethargy', 'mana' => 3, 'cyclic' => true }
+
+      expect(DRCA).not_to receive(:prepare?)
+      expect(DRCA).not_to receive(:release_cyclics)
+
+      instance.send(:prepare_spell, data, gs)
+
+      expect(gs.casting).to be false
+    end
+
+    it 'clears casting_* sub-flags on the abort path so they do not bleed into the next cast' do
+      # A cyclic prep sets casting_cyclic and releases cyclics BEFORE prepare?; a
+      # sorcery caller sets casting_sorcery. On failure all must be reset, or the
+      # next (non-cyclic/non-sorcery) cast mis-fires avtalia_cyclic / stows a weapon.
+      allow(DRCA).to receive(:prepare?).and_return(false)
+      allow(DRCA).to receive(:release_cyclics)
+
+      instance = build_spell_process
+      instance.instance_variable_set(:@should_invoke, [5]) # stale cambrinth intent from a prior cast
+      gs = build_prep_state(casting_sorcery: true)
+      data = { 'abbrev' => 'FIRE', 'name' => 'Fire Spirit', 'mana' => 3, 'cyclic' => true }
+
+      instance.send(:prepare_spell, data, gs)
+
+      expect(DRCA).to have_received(:release_cyclics) # side-effect ran (spell not disabled)
+      expect(gs.casting_cyclic).to be false           # ...but the flag it set was reset
+      expect(gs.casting_sorcery).to be false
+      expect(gs.casting).to be false
+      expect(instance.instance_variable_get(:@should_invoke)).to be_nil # no stale cambrinth intent
+    end
+  end
+
+  # ===========================================================================
+  # target_enemy -> live-creature migration. An offensive spell's configured
+  # target_enemy stays a NOUN in config (ids are not stable across hunts), but at
+  # runtime we resolve that noun to a LIVE + HOSTILE Lich::DragonRealms::Creature
+  # and face it by #<id>, falling back to the noun when no live creature matches
+  # (e.g. the name-less crtrStatus window). This branch's harness Creature stub
+  # has no `targets`, so it is stubbed per-example (verify_partial_doubles is off).
+  # ===========================================================================
+  describe 'target_enemy live-creature targeting' do
+    def build_prep_state(**attrs)
+      gs = GameState.allocate
+      { casting: false, cast_timer: nil }.merge(attrs).each { |k, v| gs.send(:"#{k}=", v) }
+      gs
+    end
+
+    describe '#prepare_spell' do
+      before(:each) do
+        # prepare_spell continues into DRCA.prepare? after facing; stop it there
+        # so these examples isolate the face command.
+        allow(DRCA).to receive(:prepare?).and_return(false)
+      end
+
+      it 'faces the live creature by id (#111) when a matching noun is on the roster' do
+        allow(Lich::DragonRealms::Creature).to receive(:targets)
+          .and_return([OpenStruct.new(id: 111, noun: 'kobold', name: 'a kobold')])
+
+        instance = build_spell_process
+        allow(instance).to receive(:fput)
+        gs = build_prep_state
+        data = { 'abbrev' => 'FIRE', 'name' => 'Fire Spirit', 'mana' => 3, 'target_enemy' => 'kobold' }
+
+        instance.send(:prepare_spell, data, gs)
+
+        expect(instance).to have_received(:fput).with('face #111')
+        expect(instance).not_to have_received(:fput).with('face kobold')
+      end
+
+      it 'falls back to the configured noun when no live creature matches' do
+        allow(Lich::DragonRealms::Creature).to receive(:targets).and_return([])
+
+        instance = build_spell_process
+        allow(instance).to receive(:fput)
+        gs = build_prep_state
+        data = { 'abbrev' => 'FIRE', 'name' => 'Fire Spirit', 'mana' => 3, 'target_enemy' => 'kobold' }
+
+        instance.send(:prepare_spell, data, gs)
+
+        expect(instance).to have_received(:fput).with('face kobold')
+      end
+    end
+
+    describe '#check_offensive selection gate' do
+      def build_offensive_state
+        double('GameState', casting: false, npcs: ['a kobold'],
+                            is_offense_allowed?: true, dancing?: false,
+                            sort_by_rate_then_rank: ['Warding'])
+      end
+
+      let(:target_enemy_spell) do
+        { 'abbrev' => 'FIRE', 'name' => 'Fire Spirit', 'skill' => 'Warding', 'target_enemy' => 'kobold' }
+      end
+
+      def build_target_enemy_process
+        build_spell_process(
+          offensive_spells: [target_enemy_spell],
+          offensive_spell_cycle: [],
+          offensive_spell_mana_threshold: 0
+        )
+      end
+
+      it 'rejects the spell when no live creature matches the configured noun' do
+        DRStats.mana = 100
+        allow(Lich::DragonRealms::Creature).to receive(:targets).and_return([])
+
+        instance = build_target_enemy_process
+        gs = build_offensive_state
+
+        expect(instance).not_to receive(:prepare_spell)
+        instance.send(:check_offensive, gs)
+      end
+
+      it 'keeps the spell when a live creature matches the configured noun' do
+        DRStats.mana = 100
+        allow(Lich::DragonRealms::Creature).to receive(:targets)
+          .and_return([OpenStruct.new(id: 111, noun: 'kobold', name: 'a kobold')])
+
+        instance = build_target_enemy_process
+        gs = build_offensive_state
+
+        expect(instance).to receive(:prepare_spell).with(hash_including('target_enemy' => 'kobold'), gs)
+        instance.send(:check_offensive, gs)
+      end
+    end
+  end
+
+  # ===========================================================================
+  # #spell_disabled? / #disable_spell -- boundary and edge behavior
+  # ===========================================================================
+  describe '#disable_spell / #spell_disabled?' do
+    it 'is a no-op with no crash when the spell has no abbrev' do
+      instance = build_spell_process
+      allow(DRC).to receive(:message)
+
+      instance.send(:disable_spell, { 'name' => 'Nameless' })
+
+      expect(DRC).not_to have_received(:message)
+      expect(instance.send(:spell_disabled?, nil)).to be false
+    end
+
+    it 'returns false for a fresh instance that never disabled anything' do
+      instance = build_spell_process
+      expect(instance.send(:spell_disabled?, 'foc')).to be false
+    end
+
+    it 'matches case-insensitively and announces exactly once per abbrev' do
+      allow(DRC).to receive(:message)
+      instance = build_spell_process
+
+      instance.send(:disable_spell, { 'abbrev' => 'FOC', 'name' => 'Focus' })
+      instance.send(:disable_spell, { 'abbrev' => 'foc', 'name' => 'Focus' })
+
+      expect(DRC).to have_received(:message).once
+      expect(instance.send(:spell_disabled?, 'foc')).to be true
+      expect(instance.send(:spell_disabled?, 'FOC')).to be true
+    end
+  end
+
+  # ===========================================================================
+  # #check_timer -- the 70s recovery shares reset_casting_state, boundary-tested
+  # ===========================================================================
+  describe '#check_timer' do
+    it 'releases and fully resets casting state once the 70s window is exceeded' do
+      allow(DRC).to receive(:bput)
+      instance = build_spell_process
+      instance.instance_variable_set(:@should_invoke, [5]) # a cambrinth cast that timed out mid-flight
+      gs = GameState.allocate
+      gs.casting = true
+      gs.casting_sorcery = true
+      gs.cast_timer = Time.now - 71
+
+      instance.send(:check_timer, gs)
+
+      expect(DRC).to have_received(:bput).with('release spell', anything, anything)
+      expect(gs.casting).to be false
+      expect(gs.casting_sorcery).to be false
+      expect(gs.cast_timer).to be_nil
+      # cambrinth stays charged game-side, but the stale invoke intent must not
+      # bleed into the next cast (would wrongly gate check_current on charging).
+      expect(instance.instance_variable_get(:@should_invoke)).to be_nil
+    end
+
+    it 'does nothing while still inside the 70s window (boundary)' do
+      instance = build_spell_process
+      gs = GameState.allocate
+      gs.casting = true
+      gs.casting_sorcery = true
+      gs.cast_timer = Time.now - 10 # well inside the 70s window: must NOT fire
+
+      expect(DRC).not_to receive(:bput)
+      instance.send(:check_timer, gs)
+
+      expect(gs.casting).to be true
+      expect(gs.casting_sorcery).to be true
+    end
+  end
+
+  # ===========================================================================
+  # #check_buffs -- the disabled filter is load-bearing: without it a disabled
+  # always-due buff is re-selected by `find` every tick and monopolizes the one
+  # per-tick buff slot, starving every other due buff.
+  # ===========================================================================
+  describe '#check_buffs' do
+    it 'skips a disabled always-due buff and casts the next due buff instead' do
+      DRStats.mana = 100
+      DRSpells._set_active_spells({}) # nothing active -> every buff is "due"
+      # NB: don't touch the shared $weapon_buffs global (reset_data doesn't restore
+      # it). BadBuff/GoodBuff aren't weapon buffs, so check_buff_conditions? already
+      # returns true against the real $weapon_buffs list.
+
+      # Disabled buff listed FIRST: with the filter gone, `find` would pick it every tick.
+      buffs = {
+        'BadBuff'  => { 'abbrev' => 'bad',  'name' => 'BadBuff',  'recast' => 5 },
+        'GoodBuff' => { 'abbrev' => 'good', 'name' => 'GoodBuff', 'recast' => 5 }
+      }
+      instance = build_spell_process(
+        buff_spells: buffs,
+        buff_spell_mana_threshold: 0,
+        buff_force_cambrinth: nil,
+        disabled_spells: Set.new(['bad'])
+      )
+      gs = double('GameState', casting: false)
+      allow(gs).to receive(:casting_weapon_buff=)
+
+      # Must prepare the healthy buff, never the disabled one.
+      expect(instance).to receive(:prepare_spell).with(hash_including('abbrev' => 'good'), anything, anything)
+      instance.send(:check_buffs, gs)
+    end
+  end
+
+  # ===========================================================================
+  # #check_training -- same filter, same starvation risk on the training slot.
+  # ===========================================================================
+  describe '#check_training' do
+    it 'does not train a disabled spell (the skill is filtered out)' do
+      DRStats.mana = 100
+      ward = { 'abbrev' => 'ward', 'name' => 'Warding Spell', 'harmless' => true }
+
+      instance = build_spell_process(
+        training_spells: { 'Warding' => ward },
+        training_spells_max_threshold: nil,
+        release_cyclic_on_low_mana: nil,
+        training_spell_mana_threshold: 0,
+        magic_exp_training_max_threshold: 100,
+        training_spells_wait: 45,
+        training_cyclic_timer: Time.now,
+        disabled_spells: Set.new(['ward'])
+      )
+      gs = double('GameState', casting: false, is_offense_allowed?: false)
+      # Returns its input so, if the filter let 'Warding' through, it would be
+      # selected and prepare_spell would run -- the filter is what prevents it.
+      allow(gs).to receive(:sort_by_rate_then_rank) { |arr| arr }
+
+      expect(instance).not_to receive(:prepare_spell)
+      instance.send(:check_training, gs)
+    end
+  end
+
+  # ===========================================================================
+  # #check_offensive -- the select filter skips a disabled spell (slot efficiency)
+  # ===========================================================================
+  describe '#check_offensive' do
+    it 'filters out a disabled offensive spell rather than choosing it for the tick' do
+      DRStats.mana = 100
+      disabled_spell = { 'abbrev' => 'LETH', 'name' => 'Lethargy', 'skill' => 'Debilitation' }
+
+      instance = build_spell_process(
+        offensive_spells: [disabled_spell],
+        offensive_spell_cycle: [],
+        offensive_spell_mana_threshold: 0,
+        disabled_spells: Set.new(['leth'])
+      )
+      # sort_by_rate_then_rank returns the spell's skill so that, if the filter
+      # let the disabled spell through, `data` would resolve to it and
+      # prepare_spell would be called -- i.e. the filter, not `return unless data`,
+      # is what keeps prepare_spell from running.
+      gs = double('GameState', casting: false, npcs: ['an orc'],
+                               is_offense_allowed?: true, dancing?: false,
+                               sort_by_rate_then_rank: ['Debilitation'])
+
+      expect(instance).not_to receive(:prepare_spell)
+      instance.send(:check_offensive, gs)
+    end
+  end
+
+  # ===========================================================================
+  # #check_health_empath -- disable covers the rebuilt healing hashes, and the
+  # FOC->HEAL fallback still heals when only the primary spell is disabled.
+  # ===========================================================================
+  describe '#check_health_empath' do
+    it 'does not ping the game for a disabled Vitality Healing during regeneration' do
+      DRStats.health = 50
+      DRSpells._set_active_spells({ 'Regenerate' => 100 })
+      allow(DRCA).to receive(:prepare?)
+
+      instance = build_spell_process(
+        empath_spells: { 'VH' => [5] },
+        empath_vitality_threshold: 75,
+        wounds: {},
+        disabled_spells: Set.new(['vh'])
+      )
+      gs = GameState.allocate
+
+      instance.send(:check_health_empath, gs)
+
+      expect(DRCA).not_to have_received(:prepare?)
+    end
+
+    # Regression: the passive-heal guard was keyed off 'Regeneration', but the
+    # active_spells key the game reports is 'Regenerate'. The typo meant the guard
+    # never matched, so empaths actively burned FOC/HEAL mana on wounds a running
+    # Regenerate was already clearing. With Regenerate active we must early-return
+    # and NOT prepare an active healing spell.
+    it 'skips active FOC healing while Regenerate is running' do
+      DRStats.health = 100
+      DRSpells._set_active_spells({ 'Regenerate' => 100 })
+
+      instance = build_spell_process(
+        empath_spells: { 'FOC' => [5] },
+        empath_vitality_threshold: 75,
+        perc_health_timer: Time.now, # skip the perceive-health refresh branch
+        wounds: { 'chest' => 3 }
+      )
+      allow(instance).to receive(:prepare_spell)
+      gs = GameState.allocate
+
+      instance.send(:check_health_empath, gs)
+
+      expect(instance).not_to have_received(:prepare_spell)
+    end
+
+    it 'falls back to HEAL when FOC is disabled' do
+      DRStats.health = 100
+      DRSpells._set_active_spells({})
+      allow(DRCA).to receive(:prepare?).and_return('prepared')
+      allow(DRCA).to receive(:check_to_harness)
+
+      instance = build_spell_process(
+        empath_spells: { 'FOC' => [5], 'HEAL' => [5] },
+        empath_vitality_threshold: 75,
+        perc_health_timer: Time.now, # skip the perceive-health refresh branch
+        wounds: { 'head' => 5 },
+        disabled_spells: Set.new(['foc'])
+      )
+      gs = GameState.allocate
+      gs.casting = false
+
+      instance.send(:check_health_empath, gs)
+
+      expect(DRCA).to have_received(:prepare?).with('heal', any_args)
+    end
+  end
+
+  # ===========================================================================
+  # Necromancer callers -- UNGUARDED (no select filter): the central guard is what
+  # protects them, and it must also clear the casting_* sub-flag they set BEFORE
+  # calling prepare_spell, or necro_casting? sticks true and suppresses
+  # looting/rituals/pet creation for the rest of the session.
+  # ===========================================================================
+  describe '#check_consume' do
+    it 'does not ping the game for a disabled necromancer Siphon Vitality' do
+      DRStats.guild = 'Necromancer'
+      DRStats.health = 1
+      allow(DRCA).to receive(:prepare?)
+
+      instance = build_spell_process(
+        necromancer_healing: { 'Siphon Vitality' => { 'abbrev' => 'sv', 'name' => 'Siphon Vitality', 'mana' => 5 } },
+        siphon_vit_threshold: '100',
+        disabled_spells: Set.new(['sv'])
+      )
+      gs = GameState.allocate
+      gs.casting = false
+      allow(gs).to receive(:npcs).and_return(['an orc'])
+
+      instance.send(:check_consume, gs)
+
+      expect(DRCA).not_to have_received(:prepare?)
+    end
+  end
+
+  describe '#check_cfb' do
+    it 'does not leave casting_cfb set (necro_casting? stays false) when Call from Beyond is disabled' do
+      DRStats.guild = 'Necromancer'
+      allow(DRCA).to receive(:prepare?)
+
+      instance = build_spell_process(
+        necromancer_zombie: { 'Call from Beyond' => { 'abbrev' => 'cfb', 'name' => 'Call from Beyond', 'mana' => 5 } },
+        disabled_spells: Set.new(['cfb'])
+      )
+      gs = GameState.allocate
+      gs.casting = false
+      gs.casting_cfb = false
+      gs.prepare_cfb = true # a trigger fired, so check_cfb will try to cast it
+
+      instance.send(:check_cfb, gs)
+
+      expect(DRCA).not_to have_received(:prepare?) # central guard skipped it
+      expect(gs.casting_cfb).to be false           # ...and cleared the flag check_cfb set
+      expect(gs.necro_casting?).to be false # so loot/rituals/pets are NOT suppressed
     end
   end
 end
@@ -3216,6 +4733,35 @@ RSpec.describe LootProcess do
 
         expect(DRCI).not_to have_received(:swap_out_full_gempouch?)
       end
+    end
+  end
+
+  # Regression: a stray blank/nil entry in the lootables list -- e.g. an empty
+  # line in a profile's loot_additions YAML, which parses to nil -- must be
+  # dropped before it reaches the stow path. A nil raises on item.split (and on
+  # GameState#lootable?'s downcase); an empty string builds a bare "stow " that
+  # the game applies to whatever is in hand, stowing the character's weapon
+  # mid-combat and leaving them punching barehanded.
+  describe '#stow_lootables with a blank or nil lootable entry' do
+    before(:each) do
+      allow(DRC).to receive(:bput).and_return('You put')
+      $left_hand = nil
+      $right_hand = nil
+      DRRoom.room_objs = ['a pale seahorse sapphire']
+    end
+
+    it 'does not fire a bare stow (which would stow a held weapon) for an empty entry' do
+      gs = build_game_state(sheath_whirlwind_offhand: nil, wield_whirlwind_offhand: nil)
+      instance = build_loot_process(lootables: ['sapphire', ''])
+      instance.send(:stow_lootables, gs)
+      expect(DRC).not_to have_received(:bput).with(/\Astow\s*\z/, any_args)
+    end
+
+    it 'does not raise on a nil entry and still loots valid items' do
+      gs = build_game_state(sheath_whirlwind_offhand: nil, wield_whirlwind_offhand: nil)
+      instance = build_loot_process(lootables: [nil, 'sapphire'])
+      expect { instance.send(:stow_lootables, gs) }.not_to raise_error
+      expect(DRC).to have_received(:bput).with('stow sapphire', any_args)
     end
   end
 end
@@ -3725,6 +5271,1942 @@ RSpec.describe TrainerProcess do
 
         expect(DRC).to have_received(:bput).with('turn almanac to Forging', 'You turn', 'You attempt to turn')
       end
+    end
+  end
+end
+
+# ===================================================================
+# TrainerProcess -- Recall ability (DRRoom->Creature migration)
+#
+# The Recall ability now targets a LIVE hostile creature by id
+# (recall #<id>) via Lich::DragonRealms::Creature.targets, instead of
+# an arbitrary DRRoom noun from game_state.npcs. Driven through
+# #execute with select_ability stubbed to 'Recall', the same way the
+# dispatch fires at runtime.
+# ===================================================================
+RSpec.describe 'TrainerProcess#execute Recall' do
+  before(:each) { ct_setup }
+
+  def build_trainer
+    trainer = TrainerProcess.allocate
+    allow(trainer).to receive(:waitrt?)
+    allow(trainer).to receive(:select_ability).and_return('Recall')
+    trainer
+  end
+
+  it 'recalls the live hostile target by id, not by DRRoom noun' do
+    allow(Lich::DragonRealms::Creature).to receive(:targets)
+      .and_return([OpenStruct.new(id: 333, noun: 'goblin', name: 'a goblin')])
+    allow(DRC).to receive(:bput)
+
+    build_trainer.execute(double('GameState', danger: false))
+
+    expect(DRC).to have_received(:bput)
+      .with('recall #333', 'Roundtime', 'You are far too occupied', 'You search your mind')
+    expect(DRC).not_to have_received(:bput).with('recall goblin', any_args)
+  end
+
+  it 'issues no recall when there are no live targets' do
+    allow(Lich::DragonRealms::Creature).to receive(:targets).and_return([])
+    allow(DRC).to receive(:bput)
+
+    build_trainer.execute(double('GameState', danger: false))
+
+    expect(DRC).not_to have_received(:bput)
+  end
+end
+
+# ===================================================================
+# Summoned-weapon-aware store/restore (Issue 1 regression)
+#
+# A moon mage (or warrior mage) trains with a SUMMONED weapon whose
+# configured name is the spell noun ("moonblade" / "moonstaff" / an
+# elemental weapon), which is NOT a gear-list item. Routines that stow
+# then re-wield the weapon around an interruption (astrology telescope,
+# a sorcery-boosted cast, a cleric ritual) used the raw EquipmentManager
+# path, which can never match the summoned name: it printed
+#   "EquipmentManager: Failed to match a weapon for moonblade:<skill>"
+# and left the blade stuck in hand (blocking the telescope) or the
+# character unarmed after re-wield returned false.
+#
+# GameState#stow_or_store_weapon and #restore_weapon route summoned
+# weapons through wear/break + re-hold/reshape instead, matching what
+# SetupProcess#check_weapon already does on a weapon switch. Non-summoned
+# weapons fall through to the identical EquipmentManager calls as before.
+# ===================================================================
+RSpec.describe 'GameState summoned-weapon store/restore' do
+  before(:each) { ct_setup }
+
+  # Real GameState (allocate) with just the fields the two helpers touch.
+  # summoned membership is keyed on the weapon SKILL, so weapon_name is free
+  # to be the (non-gear) summoned noun.
+  def build_weapon_state(weapon_skill:, weapon_name:, summoned_weapons:, equipment_manager: nil)
+    gs = GameState.allocate
+    gs.instance_variable_set(:@current_weapon_skill, weapon_skill)
+    gs.instance_variable_set(:@weapons_to_train, { weapon_skill => weapon_name })
+    gs.instance_variable_set(:@summoned_weapons, summoned_weapons)
+    gs.instance_variable_set(:@equipment_manager, equipment_manager || double('EquipmentManager', stow_weapon: nil, wield_weapon?: nil))
+    gs.instance_variable_set(:@summoned_weapons_adjective, nil)
+    gs.instance_variable_set(:@summoned_weapons_element, nil)
+    gs.instance_variable_set(:@summoned_weapons_ingot, nil)
+    gs
+  end
+
+  describe '#stow_or_store_weapon' do
+    it 'wears (not stows) a moon mage summoned weapon to free the hand' do
+      DRStats.guild = 'Moon Mage'
+      em = double('EquipmentManager')
+      gs = build_weapon_state(weapon_skill: 'Large Edged', weapon_name: 'moonblade',
+                              summoned_weapons: [{ 'name' => 'Large Edged' }], equipment_manager: em)
+      expect(DRCMM).to receive(:wear_moon_weapon?)
+      expect(em).not_to receive(:stow_weapon)
+      expect(DRCS).not_to receive(:break_summoned_weapon)
+      gs.stow_or_store_weapon
+    end
+
+    it 'breaks a warrior mage summoned weapon by its configured name' do
+      DRStats.guild = 'Warrior Mage'
+      gs = build_weapon_state(weapon_skill: 'Large Edged', weapon_name: 'fiery sword',
+                              summoned_weapons: [{ 'name' => 'Large Edged' }])
+      expect(DRCS).to receive(:break_summoned_weapon).with('fiery sword')
+      expect(DRCMM).not_to receive(:wear_moon_weapon?)
+      gs.stow_or_store_weapon
+    end
+
+    it 'stows a normal gear weapon via EquipmentManager' do
+      DRStats.guild = 'Barbarian'
+      em = double('EquipmentManager')
+      gs = build_weapon_state(weapon_skill: 'Large Edged', weapon_name: 'war sword',
+                              summoned_weapons: [], equipment_manager: em)
+      expect(em).to receive(:stow_weapon).with('war sword')
+      gs.stow_or_store_weapon
+    end
+
+    # boundary: summoned membership is by SKILL, not by the weapon's noun
+    it 'treats the weapon as summoned based on skill even when the name looks mundane' do
+      DRStats.guild = 'Moon Mage'
+      gs = build_weapon_state(weapon_skill: 'Small Edged', weapon_name: 'moonblade',
+                              summoned_weapons: [{ 'name' => 'Small Edged' }])
+      expect(DRCMM).to receive(:wear_moon_weapon?)
+      gs.stow_or_store_weapon
+    end
+
+    # boundary: a nil weapon_skill is not a summoned skill -> normal stow, no crash
+    it 'handles a nil weapon_skill without raising (normal stow path)' do
+      em = double('EquipmentManager')
+      gs = build_weapon_state(weapon_skill: nil, weapon_name: nil,
+                              summoned_weapons: [{ 'name' => 'Large Edged' }], equipment_manager: em)
+      expect(em).to receive(:stow_weapon).with(nil)
+      expect { gs.stow_or_store_weapon }.not_to raise_error
+    end
+
+    # adversarial: a summoned weapon under a non-moon, non-warrior-mage guild
+    # (a misconfiguration) falls into the break branch -- documents the
+    # else = break disposition rather than silently stowing to the gear list.
+    it 'breaks a summoned weapon for a non-moon, non-warrior-mage guild' do
+      DRStats.guild = 'Ranger'
+      gs = build_weapon_state(weapon_skill: 'Large Edged', weapon_name: 'summoned thing',
+                              summoned_weapons: [{ 'name' => 'Large Edged' }])
+      expect(DRCS).to receive(:break_summoned_weapon).with('summoned thing')
+      gs.stow_or_store_weapon
+    end
+  end
+
+  describe '#restore_weapon' do
+    it 're-holds and reshapes a summoned weapon instead of gear-matching it' do
+      DRStats.guild = 'Moon Mage'
+      em = double('EquipmentManager')
+      gs = build_weapon_state(weapon_skill: 'Large Edged', weapon_name: 'moonblade',
+                              summoned_weapons: [{ 'name' => 'Large Edged' }], equipment_manager: em)
+      expect(gs).to receive(:prepare_summoned_weapon).with(false)
+      expect(em).not_to receive(:wield_weapon?)
+      gs.restore_weapon
+    end
+
+    # THE core regression: a summoned moonblade must never reach EquipmentManager
+    # (that raw path is what printed "Failed to match a weapon for moonblade:<skill>").
+    it 'never calls EquipmentManager#wield_weapon? for a summoned moonblade' do
+      DRStats.guild = 'Moon Mage'
+      em = double('EquipmentManager') # strict: any wield_weapon? call fails the example
+      gs = build_weapon_state(weapon_skill: 'Small Edged', weapon_name: 'moonblade',
+                              summoned_weapons: [{ 'name' => 'Small Edged' }], equipment_manager: em)
+      allow(gs).to receive(:prepare_summoned_weapon)
+      expect(em).not_to receive(:wield_weapon?)
+      gs.restore_weapon
+    end
+
+    it 'wields a normal gear weapon via EquipmentManager with name and skill' do
+      DRStats.guild = 'Barbarian'
+      em = double('EquipmentManager', wield_weapon?: true)
+      gs = build_weapon_state(weapon_skill: 'Large Edged', weapon_name: 'war sword',
+                              summoned_weapons: [], equipment_manager: em)
+      expect(em).to receive(:wield_weapon?).with('war sword', 'Large Edged')
+      expect(gs).not_to receive(:prepare_summoned_weapon)
+      gs.restore_weapon
+    end
+
+    it 'handles a nil weapon_skill without raising (normal wield path)' do
+      em = double('EquipmentManager', wield_weapon?: nil)
+      gs = build_weapon_state(weapon_skill: nil, weapon_name: nil,
+                              summoned_weapons: [{ 'name' => 'Large Edged' }], equipment_manager: em)
+      expect { gs.restore_weapon }.not_to raise_error
+    end
+
+    # integration: the REAL prepare_summoned_weapon runs (DRCS/DRCMM no-ops) and
+    # must issue no EquipmentManager calls at all.
+    it 'real prepare_summoned_weapon path issues no EquipmentManager calls' do
+      DRStats.guild = 'Moon Mage'
+      UserVars._set_moons({ 'visible' => ['Katamba'] })
+      em = double('EquipmentManager') # strict: no stow_weapon / wield_weapon? allowed
+      gs = build_weapon_state(weapon_skill: 'Large Edged', weapon_name: 'moonblade',
+                              summoned_weapons: [{ 'name' => 'Large Edged' }], equipment_manager: em)
+      expect { gs.restore_weapon }.not_to raise_error
+    end
+  end
+
+  describe 'store then restore round trip' do
+    it 'moon mage wears then re-holds, never touching the gear list' do
+      DRStats.guild = 'Moon Mage'
+      em = double('EquipmentManager') # strict: neither stow_weapon nor wield_weapon? allowed
+      gs = build_weapon_state(weapon_skill: 'Large Edged', weapon_name: 'moonblade',
+                              summoned_weapons: [{ 'name' => 'Large Edged' }], equipment_manager: em)
+      allow(gs).to receive(:prepare_summoned_weapon)
+      expect(DRCMM).to receive(:wear_moon_weapon?)
+      gs.stow_or_store_weapon
+      gs.restore_weapon
+      expect(gs).to have_received(:prepare_summoned_weapon).with(false)
+    end
+  end
+
+  # -----------------------------------------------------------------
+  # #appraise -- targets live creatures by id (Creature migration)
+  #
+  # appraise now walks Lich::DragonRealms::Creature.targets (live +
+  # hostile) and issues `app #<id> <modifier>`, keying the "already
+  # appraised" memory (@no_app) on the creature id instead of the noun.
+  # Verify the id-based command, the id-keyed dedup, and the rank gate.
+  # -----------------------------------------------------------------
+  describe '#appraise' do
+    def build_appraiser(no_app: [])
+      trainer = TrainerProcess.allocate
+      trainer.instance_variable_set(:@no_app, no_app)
+      trainer
+    end
+
+    def appraise_state(retreating: false)
+      double('GameState', retreating?: retreating)
+    end
+
+    before(:each) do
+      allow(DRSkill).to receive(:getrank).with('Appraisal').and_return(100)
+    end
+
+    it 'issues `app #<id>` for the live creature, not `app <noun>`' do
+      allow(Lich::DragonRealms::Creature).to receive(:targets)
+        .and_return([OpenStruct.new(id: 444, noun: 'troll', name: 'a troll')])
+      allow(DRC).to receive(:bput).and_return('Perhaps that')
+
+      build_appraiser.send(:appraise, appraise_state, 'value')
+
+      expect(DRC).to have_received(:bput).with('app #444 value', any_args)
+      expect(DRC).not_to have_received(:bput).with('app troll value', any_args)
+    end
+
+    it 'records the id on a `Perhaps that` response and skips it next call' do
+      allow(Lich::DragonRealms::Creature).to receive(:targets)
+        .and_return([OpenStruct.new(id: 444, noun: 'troll', name: 'a troll')])
+      allow(DRC).to receive(:bput).and_return('Perhaps that')
+
+      trainer = build_appraiser
+      trainer.send(:appraise, appraise_state, 'value')
+      expect(trainer.instance_variable_get(:@no_app)).to eq([444])
+
+      # Only the one live target remains and it is already appraised -> no bput.
+      trainer.send(:appraise, appraise_state, 'value')
+      expect(DRC).to have_received(:bput).once
+    end
+
+    it 'appraises the next live target when the first id is already recorded' do
+      targets = [
+        OpenStruct.new(id: 444, noun: 'troll', name: 'a troll'),
+        OpenStruct.new(id: 555, noun: 'ogre', name: 'an ogre')
+      ]
+      allow(Lich::DragonRealms::Creature).to receive(:targets).and_return(targets)
+      allow(DRC).to receive(:bput).and_return('Perhaps that')
+
+      build_appraiser(no_app: [444]).send(:appraise, appraise_state, 'value')
+
+      expect(DRC).to have_received(:bput).with('app #555 value', any_args)
+    end
+
+    it 'does not appraise when Appraisal rank is below 76' do
+      allow(DRSkill).to receive(:getrank).with('Appraisal').and_return(75)
+      allow(Lich::DragonRealms::Creature).to receive(:targets)
+        .and_return([OpenStruct.new(id: 444, noun: 'troll', name: 'a troll')])
+      allow(DRC).to receive(:bput)
+
+      build_appraiser.send(:appraise, appraise_state, 'value')
+
+      expect(DRC).not_to have_received(:bput)
+    end
+  end
+end
+
+# ===================================================================
+# TrainerProcess#check_heavens (Issue 1 -- astrology)
+#
+# Astrology needs a free hand for the telescope. For a moon mage the
+# weapon is a summoned moonblade; the old code stowed/re-wielded it via
+# EquipmentManager, which could not match "moonblade" -- so the blade was
+# never freed (telescope failed) and re-wield spammed the match error.
+# check_heavens now uses the summoned-aware store/restore seam.
+# ===================================================================
+RSpec.describe 'TrainerProcess#check_heavens' do
+  before(:each) { ct_setup }
+
+  def build_heavens_trainer(have_telescope: true, equipment_manager: nil)
+    tp = TrainerProcess.allocate
+    tp.instance_variable_set(:@have_telescope, have_telescope)
+    tp.instance_variable_set(:@telescope_name, 'telescope')
+    tp.instance_variable_set(:@telescope_storage, 'case')
+    tp.instance_variable_set(:@equipment_manager, equipment_manager) if equipment_manager
+    tp
+  end
+
+  it 'stows via the summoned-aware seam before observing and restores after' do
+    tp = build_heavens_trainer
+    allow(tp).to receive(:determine_time)
+    allow(DRCMM).to receive(:get_telescope?).and_return(true)
+    gs = double('GameState')
+    expect(gs).to receive(:stow_or_store_weapon).ordered
+    expect(gs).to receive(:restore_weapon).ordered
+    tp.send(:check_heavens, gs)
+  end
+
+  it 'observes the sky when a telescope is retrieved' do
+    tp = build_heavens_trainer(have_telescope: true)
+    allow(DRCMM).to receive(:get_telescope?).and_return(true)
+    gs = double('GameState', stow_or_store_weapon: nil, restore_weapon: nil)
+    expect(tp).to receive(:determine_time)
+    tp.send(:check_heavens, gs)
+  end
+
+  it 'skips observing but still restores the weapon when the telescope cannot be retrieved' do
+    tp = build_heavens_trainer(have_telescope: true)
+    allow(DRCMM).to receive(:get_telescope?).and_return(false)
+    gs = double('GameState')
+    expect(gs).to receive(:stow_or_store_weapon)
+    expect(tp).not_to receive(:determine_time)
+    expect(gs).to receive(:restore_weapon)
+    tp.send(:check_heavens, gs)
+  end
+
+  it 'observes without a telescope check when have_telescope is false' do
+    tp = build_heavens_trainer(have_telescope: false)
+    gs = double('GameState', stow_or_store_weapon: nil, restore_weapon: nil)
+    expect(DRCMM).not_to receive(:get_telescope?)
+    expect(tp).to receive(:determine_time)
+    tp.send(:check_heavens, gs)
+  end
+
+  # Regression: check_heavens must not touch EquipmentManager directly anymore.
+  it 'never calls EquipmentManager directly (summoned weapons stay off the gear path)' do
+    em = double('EquipmentManager') # strict: any call fails the example
+    tp = build_heavens_trainer(have_telescope: true, equipment_manager: em)
+    allow(tp).to receive(:determine_time)
+    allow(DRCMM).to receive(:get_telescope?).and_return(true)
+    gs = double('GameState', stow_or_store_weapon: nil, restore_weapon: nil)
+    expect { tp.send(:check_heavens, gs) }.not_to raise_error
+  end
+end
+
+# ===================================================================
+# TrainerProcess#meraud_commune (Issue 7539)
+#
+# A sub-300 Theurgy character could only commune in an empty room, so
+# the Meraud commune -- and last_rites, which only fires once the
+# commune sets game_state.blessed_room -- effectively never fired
+# during a hunt (the room rarely clears of npcs). It now retreats out
+# of melee first, the way #pray_mat does, and communes with npcs present.
+# ===================================================================
+RSpec.describe 'TrainerProcess#meraud_commune' do
+  before(:each) { ct_setup }
+
+  def build_meraud_trainer(**overrides)
+    tp = TrainerProcess.allocate
+    defaults = {
+      equipment_manager: double('EquipmentManager', stow_weapon: nil, wield_weapon?: true),
+      theurgy_supply_container: 'sack',
+      water_holder: 'chalice',
+      flint_lighter: 'flint',
+      training_abilities: { 'Meraud' => 3900 }
+    }
+    defaults.merge(overrides).each { |k, v| tp.instance_variable_set(:"@#{k}", v) }
+    tp
+  end
+
+  def build_meraud_state(**attrs)
+    defaults = {
+      aimed_skill?: false,
+      npcs: ['an elder razortusk boar'],
+      weapon_name: 'liscis',
+      weapon_skill: 'Large Edged',
+      cooldown_timers: {}
+    }
+    state = double('GameState', defaults.merge(attrs))
+    allow(state).to receive(:blessed_room=)
+    state
+  end
+
+  before(:each) do
+    allow(DRC).to receive(:retreat)
+    allow(DRC).to receive(:bput)
+    allow(DRC).to receive(:bput).with('commune sense', any_args).and_return('roundtime')
+  end
+
+  it 'retreats past mobs and communes for a hunter (regression: was empty-room-only)' do
+    trainer = build_meraud_trainer
+    state = build_meraud_state
+
+    trainer.send(:meraud_commune, state)
+
+    expect(DRC).to have_received(:retreat)
+    expect(DRC).to have_received(:bput).with('commune meraud', any_args)
+    expect(state).to have_received(:blessed_room=).with(true)
+  end
+
+  it 'does not retreat when the room is already empty' do
+    trainer = build_meraud_trainer
+    state = build_meraud_state(npcs: [])
+
+    trainer.send(:meraud_commune, state)
+
+    expect(DRC).not_to have_received(:retreat)
+    expect(DRC).to have_received(:bput).with('commune meraud', any_args)
+  end
+
+  it 'skips entirely when training an aimed weapon skill' do
+    trainer = build_meraud_trainer
+    state = build_meraud_state(aimed_skill?: true)
+
+    trainer.send(:meraud_commune, state)
+
+    expect(DRC).not_to have_received(:retreat)
+    expect(DRC).not_to have_received(:bput).with('commune meraud', any_args)
+    expect(state.cooldown_timers).to have_key('Meraud')
+  end
+
+  it 'skips the ritual and just marks the room blessed when already a vessel' do
+    trainer = build_meraud_trainer
+    state = build_meraud_state
+    allow(DRC).to receive(:bput).with('commune sense', any_args).and_return('Meraud')
+
+    trainer.send(:meraud_commune, state)
+
+    expect(DRC).not_to have_received(:retreat)
+    expect(DRC).not_to have_received(:bput).with('commune meraud', any_args)
+    expect(state).to have_received(:blessed_room=).with(true)
+  end
+end
+
+# ===========================================================================
+# CombatTrainer plugin system -- registry + hook dispatch
+# ===========================================================================
+# These stub plugins stand in for real combat-trainer plugins. Each is
+# deliberately tiny so the behavior under test is obvious at the call site
+# (DAMP), and each records its invocations so tests can assert exactly which
+# plugins were polled and with what arguments.
+
+# Records every hook invocation and returns a preconfigured value.
+class RecordingPlugin
+  attr_reader :calls
+
+  def initialize(return_value: nil)
+    @return_value = return_value
+    @calls = []
+  end
+
+  def warhorn_cooldown_active?(room_id:)
+    @calls << [:warhorn_cooldown_active?, { room_id: room_id }]
+    @return_value
+  end
+
+  def warhorn_applied(room_id:, type:)
+    @calls << [:warhorn_applied, { room_id: room_id, type: type }]
+    @return_value
+  end
+
+  def combat_tick(trainer, game_state, counter:)
+    @calls << [:combat_tick, [trainer, game_state], { counter: counter }]
+    @return_value
+  end
+
+  # Used only to prove method_missing forwarding through CombatTrainer.
+  def custom_command(arg)
+    @calls << [:custom_command, [arg]]
+    "handled:#{arg}"
+  end
+end
+
+# Raises whenever a hook is called, to prove dispatch isolates plugin errors.
+class ExplodingPlugin
+  def warhorn_cooldown_active?(room_id:)
+    raise "boom for #{room_id}"
+  end
+
+  def warhorn_applied(room_id:, type:)
+    raise "boom applying #{type} in #{room_id}"
+  end
+
+  def combat_tick(_trainer, _game_state, counter:)
+    raise "boom on tick #{counter}"
+  end
+end
+
+# Implements no hooks at all, to prove respond_to? gating skips it cleanly.
+class InertPlugin
+end
+
+RSpec.describe CombatTrainer do
+  before(:each) do
+    CombatTrainer.registered_plugins.clear
+  end
+
+  after(:each) do
+    CombatTrainer.registered_plugins.clear
+    $debug_mode_ct = nil
+  end
+
+  describe '.register_plugin' do
+    it 'accumulates plugins in registration order' do
+      first = RecordingPlugin.new
+      second = RecordingPlugin.new
+
+      CombatTrainer.register_plugin(first)
+      CombatTrainer.register_plugin(second)
+
+      expect(CombatTrainer.registered_plugins).to eq([first, second])
+    end
+  end
+
+  describe '.fire_hook (decision dispatch)' do
+    it 'returns nil when no plugins are registered' do
+      expect(CombatTrainer.fire_hook(:warhorn_cooldown_active?, room_id: 5)).to be_nil
+    end
+
+    it 'returns nil when registered plugins do not implement the hook' do
+      CombatTrainer.register_plugin(InertPlugin.new)
+
+      expect(CombatTrainer.fire_hook(:warhorn_cooldown_active?, room_id: 5)).to be_nil
+    end
+
+    it 'returns the first non-nil result and stops polling later plugins' do
+      first = RecordingPlugin.new(return_value: nil)
+      second = RecordingPlugin.new(return_value: true)
+      third = RecordingPlugin.new(return_value: false)
+      [first, second, third].each { |plugin| CombatTrainer.register_plugin(plugin) }
+
+      result = CombatTrainer.fire_hook(:warhorn_cooldown_active?, room_id: 7)
+
+      expect(result).to eq(true)
+      expect(third.calls).to be_empty
+    end
+
+    it 'treats a false return as a real answer (does not fall through)' do
+      answering = RecordingPlugin.new(return_value: false)
+      later = RecordingPlugin.new(return_value: true)
+      CombatTrainer.register_plugin(answering)
+      CombatTrainer.register_plugin(later)
+
+      expect(CombatTrainer.fire_hook(:warhorn_cooldown_active?, room_id: 1)).to eq(false)
+      expect(later.calls).to be_empty
+    end
+
+    it 'skips a plugin that raises and uses the next plugin answer' do
+      responder = RecordingPlugin.new(return_value: true)
+      CombatTrainer.register_plugin(ExplodingPlugin.new)
+      CombatTrainer.register_plugin(responder)
+
+      result = nil
+      expect { result = CombatTrainer.fire_hook(:warhorn_cooldown_active?, room_id: 9) }.not_to raise_error
+      expect(result).to eq(true)
+    end
+
+    it 'echoes the plugin error under $debug_mode_ct' do
+      $debug_mode_ct = true
+      CombatTrainer.register_plugin(ExplodingPlugin.new)
+
+      CombatTrainer.fire_hook(:warhorn_cooldown_active?, room_id: 9)
+
+      expect(displayed_messages).to include(a_string_matching(/ExplodingPlugin error in warhorn_cooldown_active\?/))
+    end
+
+    it 'forwards positional and keyword arguments to the hook' do
+      plugin = RecordingPlugin.new(return_value: :done)
+      CombatTrainer.register_plugin(plugin)
+      state = Object.new
+
+      CombatTrainer.fire_hook(:combat_tick, :trainer, state, counter: 42)
+
+      expect(plugin.calls).to eq([[:combat_tick, [:trainer, state], { counter: 42 }]])
+    end
+  end
+
+  describe '.notify_hook (notification dispatch)' do
+    it 'always returns nil, even when a plugin returns a value' do
+      CombatTrainer.register_plugin(RecordingPlugin.new(return_value: :ignored))
+
+      expect(CombatTrainer.notify_hook(:warhorn_applied, room_id: 1, type: 'egg')).to be_nil
+    end
+
+    it 'invokes every plugin that implements the hook, not just the first' do
+      first = RecordingPlugin.new
+      second = RecordingPlugin.new
+      CombatTrainer.register_plugin(first)
+      CombatTrainer.register_plugin(second)
+
+      CombatTrainer.notify_hook(:warhorn_applied, room_id: 3, type: 'warhorn')
+
+      expect(first.calls).to eq([[:warhorn_applied, { room_id: 3, type: 'warhorn' }]])
+      expect(second.calls).to eq([[:warhorn_applied, { room_id: 3, type: 'warhorn' }]])
+    end
+
+    it 'continues notifying the remaining plugins after one raises' do
+      survivor = RecordingPlugin.new
+      CombatTrainer.register_plugin(ExplodingPlugin.new)
+      CombatTrainer.register_plugin(survivor)
+
+      expect { CombatTrainer.notify_hook(:warhorn_applied, room_id: 4, type: 'egg') }.not_to raise_error
+      expect(survivor.calls).to eq([[:warhorn_applied, { room_id: 4, type: 'egg' }]])
+    end
+
+    it 'skips plugins that do not implement the hook' do
+      CombatTrainer.register_plugin(InertPlugin.new)
+
+      expect { CombatTrainer.notify_hook(:warhorn_applied, room_id: 4, type: 'egg') }.not_to raise_error
+    end
+  end
+
+  describe 'method_missing forwarding' do
+    it 'forwards an unknown call to the first plugin that responds' do
+      trainer = CombatTrainer.allocate
+      plugin = RecordingPlugin.new
+      CombatTrainer.register_plugin(plugin)
+
+      expect(trainer.custom_command('x')).to eq('handled:x')
+      expect(plugin.calls).to eq([[:custom_command, ['x']]])
+    end
+
+    it 'reports respond_to? true when a plugin implements the method' do
+      trainer = CombatTrainer.allocate
+      CombatTrainer.register_plugin(RecordingPlugin.new)
+
+      expect(trainer.respond_to?(:custom_command)).to be(true)
+    end
+
+    it 'raises NoMethodError when no registered plugin can handle the call' do
+      trainer = CombatTrainer.allocate
+      CombatTrainer.register_plugin(InertPlugin.new)
+
+      expect { trainer.totally_unknown_method }.to raise_error(NoMethodError)
+    end
+  end
+end
+
+# ===========================================================================
+# AbilityProcess room-effect (warhorn/egg) cooldown seam
+# ===========================================================================
+RSpec.describe 'AbilityProcess room-effect cooldown seam' do
+  before(:each) do
+    CombatTrainer.registered_plugins.clear
+    # UserVars is shared across examples; reset it so each example starts from a
+    # known state and the built-in-timer branch is exercised only when set.
+    UserVars.warhorn = nil
+    allow(DRC).to receive(:message)
+    allow(Room).to receive(:current).and_return(double('room', id: 4242))
+  end
+
+  after(:each) do
+    CombatTrainer.registered_plugins.clear
+  end
+
+  describe '#room_effect_on_cooldown?' do
+    context 'with no plugin registered (built-in per-character timer)' do
+      it 'is on cooldown when the last use was under 600s ago' do
+        instance = build_ability_process
+        UserVars.warhorn = { 'last_warhorn_or_egg' => Time.now - 599 }
+
+        expect(instance.send(:room_effect_on_cooldown?, 4242)).to be(true)
+      end
+
+      it 'is off cooldown when the last use was over 600s ago' do
+        instance = build_ability_process
+        UserVars.warhorn = { 'last_warhorn_or_egg' => Time.now - 601 }
+
+        expect(instance.send(:room_effect_on_cooldown?, 4242)).to be(false)
+      end
+
+      it 'treats exactly 600s since last use as still on cooldown (boundary)' do
+        instance = build_ability_process
+        # Freeze the clock so the boundary is exact; with a live clock the check
+        # instant drifts microseconds past 600s and the case is unobservable.
+        frozen = Time.now
+        allow(Time).to receive(:now).and_return(frozen)
+        UserVars.warhorn = { 'last_warhorn_or_egg' => frozen - 600 }
+
+        expect(instance.send(:room_effect_on_cooldown?, 4242)).to be(true)
+      end
+    end
+
+    context 'with a plugin answering the decision hook' do
+      it 'uses the plugin true answer and never consults the built-in timer' do
+        instance = build_ability_process
+        CombatTrainer.register_plugin(RecordingPlugin.new(return_value: true))
+        # UserVars.warhorn is nil here (reset in before(:each)); if the built-in
+        # branch ran it would raise on nil, proving the plugin short-circuits it.
+        UserVars.warhorn = nil
+
+        expect(instance.send(:room_effect_on_cooldown?, 4242)).to be(true)
+      end
+
+      it 'uses the plugin false answer even when the built-in timer would block' do
+        instance = build_ability_process
+        UserVars.warhorn = { 'last_warhorn_or_egg' => Time.now }
+        CombatTrainer.register_plugin(RecordingPlugin.new(return_value: false))
+
+        expect(instance.send(:room_effect_on_cooldown?, 4242)).to be(false)
+      end
+
+      it 'falls back to the built-in timer when the plugin returns nil' do
+        instance = build_ability_process
+        UserVars.warhorn = { 'last_warhorn_or_egg' => Time.now - 601 }
+        CombatTrainer.register_plugin(RecordingPlugin.new(return_value: nil))
+
+        expect(instance.send(:room_effect_on_cooldown?, 4242)).to be(false)
+      end
+
+      it 'forwards the current room id to the plugin as a keyword' do
+        instance = build_ability_process
+        plugin = RecordingPlugin.new(return_value: true)
+        CombatTrainer.register_plugin(plugin)
+
+        instance.send(:room_effect_on_cooldown?, 4242)
+
+        expect(plugin.calls).to eq([[:warhorn_cooldown_active?, { room_id: 4242 }]])
+      end
+    end
+  end
+
+  describe '#record_room_effect' do
+    it 'refreshes the built-in per-character timer to now' do
+      instance = build_ability_process
+      UserVars.warhorn = { 'last_warhorn_or_egg' => Time.now - 5000 }
+
+      instance.send(:record_room_effect, 4242, 'egg')
+
+      expect(UserVars.warhorn['last_warhorn_or_egg']).to be_within(2).of(Time.now)
+    end
+
+    it 'notifies plugins of the application with room id and type' do
+      instance = build_ability_process
+      UserVars.warhorn = { 'last_warhorn_or_egg' => Time.now }
+      plugin = RecordingPlugin.new
+      CombatTrainer.register_plugin(plugin)
+
+      instance.send(:record_room_effect, 4242, 'warhorn')
+
+      expect(plugin.calls).to eq([[:warhorn_applied, { room_id: 4242, type: 'warhorn' }]])
+    end
+  end
+
+  describe '#use_warhorn_or_egg' do
+    it 'skips use and does not rotate when the room effect is on cooldown' do
+      instance = build_ability_process(warhorn_or_egg: %w[egg warhorn])
+      UserVars.warhorn = { 'last_warhorn_or_egg' => Time.now }
+
+      expect(instance).not_to receive(:use_egg?)
+
+      instance.send(:use_warhorn_or_egg, build_game_state)
+
+      expect(instance.instance_variable_get(:@warhorn_or_egg)).to eq(%w[egg warhorn])
+    end
+
+    it 'applies an egg, records the effect, and rotates on success' do
+      instance = build_ability_process(warhorn_or_egg: %w[egg warhorn])
+      UserVars.warhorn = { 'last_warhorn_or_egg' => Time.now - 601 }
+      allow(instance).to receive(:use_egg?).and_return(true)
+      plugin = RecordingPlugin.new
+      CombatTrainer.register_plugin(plugin)
+
+      instance.send(:use_warhorn_or_egg, build_game_state)
+
+      expect(instance.instance_variable_get(:@warhorn_or_egg)).to eq(%w[warhorn egg])
+      # The plugin is also polled for the cooldown decision (it defers with nil);
+      # what matters here is that the successful application was recorded.
+      expect(plugin.calls).to include([:warhorn_applied, { room_id: 4242, type: 'egg' }])
+    end
+
+    it 'rotates without recording the effect when application fails' do
+      instance = build_ability_process(warhorn_or_egg: %w[egg warhorn])
+      UserVars.warhorn = { 'last_warhorn_or_egg' => Time.now - 601 }
+      allow(instance).to receive(:use_egg?).and_return(false)
+      plugin = RecordingPlugin.new
+      CombatTrainer.register_plugin(plugin)
+
+      instance.send(:use_warhorn_or_egg, build_game_state)
+
+      expect(instance.instance_variable_get(:@warhorn_or_egg)).to eq(%w[warhorn egg])
+      expect(plugin.calls.select { |call| call.first == :warhorn_applied }).to be_empty
+    end
+
+    it 'routes a warhorn rotation entry through use_warhorn?' do
+      instance = build_ability_process(warhorn_or_egg: %w[warhorn egg])
+      UserVars.warhorn = { 'last_warhorn_or_egg' => Time.now - 601 }
+      game_state = build_game_state
+      allow(instance).to receive(:use_warhorn?).with(game_state).and_return(true)
+
+      instance.send(:use_warhorn_or_egg, game_state)
+
+      expect(instance).to have_received(:use_warhorn?).with(game_state)
+      expect(instance.instance_variable_get(:@warhorn_or_egg)).to eq(%w[egg warhorn])
+    end
+  end
+end
+
+# ===================================================================
+# GameState#sort_by_rate_then_rank
+#
+# The shared ordering primitive behind every "what do I train next"
+# decision: dance skill selection, offhand aiming/doublestrike/whirlwind
+# skill selection, and SetupProcess weapon rotation. A regression here
+# silently starves low-rank skills, which is the exact failure mode the
+# rank tiebreaker exists to prevent.
+# ===================================================================
+RSpec.describe 'GameState#sort_by_rate_then_rank' do
+  before(:each) { ct_setup }
+
+  # sort_by_rate_then_rank reads nothing but its arguments and DRSkill,
+  # so a bare allocate with no ivars is enough.
+  let(:game_state) { GameState.allocate }
+
+  # Give each skill an explicit learning rate and rank so the ordering
+  # assertions below never depend on harness defaults.
+  def stub_skills(rates: {}, ranks: {})
+    allow(DRSkill).to receive(:getxp) { |skill| rates.fetch(skill, 0) }
+    allow(DRSkill).to receive(:getrank) { |skill| ranks.fetch(skill, 0) }
+  end
+
+  it 'orders by learning rate ascending, lowest rate first' do
+    stub_skills(rates: { 'Small Edged' => 30, 'Large Edged' => 5, 'Staves' => 17 })
+    expect(game_state.sort_by_rate_then_rank(['Small Edged', 'Large Edged', 'Staves']))
+      .to eq(['Large Edged', 'Staves', 'Small Edged'])
+  end
+
+  it 'breaks a rate tie by rank ascending, so low-rank skills are not starved' do
+    stub_skills(
+      rates: { 'Small Edged' => 10, 'Large Edged' => 10 },
+      ranks: { 'Small Edged' => 500, 'Large Edged' => 50 }
+    )
+    expect(game_state.sort_by_rate_then_rank(['Small Edged', 'Large Edged']))
+      .to eq(['Large Edged', 'Small Edged'])
+  end
+
+  it 'prefers a prioritized skill over a non-prioritized one at the same rate' do
+    stub_skills(
+      rates: { 'Small Edged' => 10, 'Large Edged' => 10 },
+      ranks: { 'Small Edged' => 50, 'Large Edged' => 500 }
+    )
+    # Large Edged has the worse rank but is prioritized, so it must still win.
+    expect(game_state.sort_by_rate_then_rank(['Small Edged', 'Large Edged'], ['Large Edged']))
+      .to eq(['Large Edged', 'Small Edged'])
+  end
+
+  it 'does not let priority override a lower learning rate' do
+    stub_skills(rates: { 'Small Edged' => 5, 'Large Edged' => 25 })
+    # Rate is the primary key -- priority only breaks ties within a rate.
+    expect(game_state.sort_by_rate_then_rank(['Small Edged', 'Large Edged'], ['Large Edged']))
+      .to eq(['Small Edged', 'Large Edged'])
+  end
+
+  it 'ranks two prioritized skills against each other by rank' do
+    stub_skills(
+      rates: { 'Small Edged' => 10, 'Large Edged' => 10 },
+      ranks: { 'Small Edged' => 500, 'Large Edged' => 50 }
+    )
+    expect(game_state.sort_by_rate_then_rank(['Small Edged', 'Large Edged'], ['Small Edged', 'Large Edged']))
+      .to eq(['Large Edged', 'Small Edged'])
+  end
+
+  it 'returns a new array and does not mutate the caller argument' do
+    stub_skills(rates: { 'Small Edged' => 30, 'Large Edged' => 5 })
+    skills = ['Small Edged', 'Large Edged']
+    result = game_state.sort_by_rate_then_rank(skills)
+
+    expect(result).not_to equal(skills)
+    expect(skills).to eq(['Small Edged', 'Large Edged'])
+  end
+
+  it 'returns an empty array for empty input rather than raising' do
+    stub_skills
+    expect(game_state.sort_by_rate_then_rank([])).to eq([])
+  end
+
+  it 'ignores a priority entry that is not among the skills being sorted' do
+    stub_skills(rates: { 'Small Edged' => 5, 'Large Edged' => 25 })
+    expect(game_state.sort_by_rate_then_rank(['Small Edged', 'Large Edged'], ['Bow']))
+      .to eq(['Small Edged', 'Large Edged'])
+  end
+
+  it 'treats a mindlocked skill (34) as the least attractive by rate' do
+    stub_skills(rates: { 'Small Edged' => 34, 'Large Edged' => 33 })
+    expect(game_state.sort_by_rate_then_rank(['Small Edged', 'Large Edged']).first)
+      .to eq('Large Edged')
+  end
+end
+
+# ===================================================================
+# GameState aim and dance queues
+#
+# Both queues are refilled from configured YAML arrays and drained with
+# shift. Because the refill uses a shallow dup, a shift that reached the
+# source array would permanently destroy the user's configured actions
+# for the rest of the session.
+# ===================================================================
+RSpec.describe 'GameState aim and dance queues' do
+  before(:each) { ct_setup }
+
+  def build_queue_state(**overrides)
+    gs = GameState.allocate
+    defaults = {
+      current_weapon_skill: 'Bow',
+      aim_queue: [],
+      dance_queue: [],
+      aim_fillers: { 'Bow' => %w[appraise analyze] },
+      aim_fillers_stealth: nil,
+      dance_actions: %w[bob weave circle],
+      dance_actions_stealth: nil,
+      combat_training_abilities_target: 0
+    }
+    defaults.merge(overrides).each { |k, v| gs.instance_variable_set(:"@#{k}", v) }
+    gs
+  end
+
+  # use_stealth? is `Stealth xp < @combat_training_abilities_target`, so a
+  # target of 0 keeps stealth off and a high target turns it on.
+  before(:each) { allow(DRSkill).to receive(:getxp).and_return(10) }
+
+  describe '#set_aim_queue' do
+    it 'fills the queue from aim_fillers for the current weapon skill' do
+      gs = build_queue_state
+      gs.set_aim_queue
+      expect(gs.instance_variable_get(:@aim_queue)).to eq(%w[appraise analyze])
+    end
+
+    it 'draining the queue does not mutate the configured aim_fillers array' do
+      fillers = { 'Bow' => %w[appraise analyze] }
+      gs = build_queue_state(aim_fillers: fillers)
+      gs.set_aim_queue
+      gs.next_aim_action
+      gs.next_aim_action
+
+      expect(gs.done_aiming?).to be true
+      expect(fillers['Bow']).to eq(%w[appraise analyze])
+    end
+
+    it 'refills from the stealth fillers when stealth is being trained' do
+      gs = build_queue_state(
+        aim_fillers_stealth: { 'Bow' => %w[hide] },
+        combat_training_abilities_target: 34
+      )
+      gs.set_aim_queue
+      expect(gs.instance_variable_get(:@aim_queue)).to eq(%w[hide])
+    end
+
+    it 'uses the normal fillers when stealth has no entry for the weapon skill' do
+      gs = build_queue_state(
+        aim_fillers_stealth: { 'Slings' => %w[hide] },
+        combat_training_abilities_target: 34
+      )
+      gs.set_aim_queue
+      expect(gs.instance_variable_get(:@aim_queue)).to eq(%w[appraise analyze])
+    end
+
+    # Asymmetry worth pinning: unlike set_dance_queue, set_aim_queue has no
+    # "return unless empty" guard, so calling it mid-queue discards whatever
+    # aim actions were still pending.
+    it 'discards pending actions when called again before the queue drains' do
+      gs = build_queue_state
+      gs.set_aim_queue
+      gs.next_aim_action
+      expect(gs.instance_variable_get(:@aim_queue)).to eq(%w[analyze])
+
+      gs.set_aim_queue
+      expect(gs.instance_variable_get(:@aim_queue)).to eq(%w[appraise analyze])
+    end
+  end
+
+  describe '#next_aim_action / #done_aiming? / #clear_aim_queue' do
+    it 'drains the queue in order and reports done only when empty' do
+      gs = build_queue_state
+      gs.set_aim_queue
+
+      expect(gs.done_aiming?).to be false
+      expect(gs.next_aim_action).to eq('appraise')
+      expect(gs.done_aiming?).to be false
+      expect(gs.next_aim_action).to eq('analyze')
+      expect(gs.done_aiming?).to be true
+    end
+
+    it 'returns nil from next_aim_action once drained' do
+      gs = build_queue_state(aim_fillers: { 'Bow' => [] })
+      gs.set_aim_queue
+      expect(gs.next_aim_action).to be_nil
+    end
+
+    it 'clear_aim_queue empties a partially drained queue' do
+      gs = build_queue_state
+      gs.set_aim_queue
+      gs.next_aim_action
+      gs.clear_aim_queue
+      expect(gs.done_aiming?).to be true
+    end
+  end
+
+  describe '#set_dance_queue' do
+    it 'fills the queue from the configured dance actions' do
+      gs = build_queue_state
+      gs.set_dance_queue
+      expect(gs.instance_variable_get(:@dance_queue)).to eq(%w[bob weave circle])
+    end
+
+    # The guard set_aim_queue lacks: a mid-queue refill must be a no-op so
+    # the dance rotation is not restarted from the top on every tick.
+    it 'is a no-op when the queue still has actions pending' do
+      gs = build_queue_state
+      gs.set_dance_queue
+      gs.next_dance_action
+
+      gs.set_dance_queue
+      expect(gs.instance_variable_get(:@dance_queue)).to eq(%w[weave circle])
+    end
+
+    it 'refills once the queue has fully drained' do
+      gs = build_queue_state
+      gs.set_dance_queue
+      3.times { gs.next_dance_action }
+
+      gs.set_dance_queue
+      expect(gs.instance_variable_get(:@dance_queue)).to eq(%w[bob weave circle])
+    end
+
+    it 'draining the queue does not mutate the configured dance_actions array' do
+      actions = %w[bob weave circle]
+      gs = build_queue_state(dance_actions: actions)
+      gs.set_dance_queue
+      3.times { gs.next_dance_action }
+
+      expect(actions).to eq(%w[bob weave circle])
+    end
+
+    it 'uses the stealth dance actions when stealth is being trained' do
+      gs = build_queue_state(
+        dance_actions_stealth: %w[hide],
+        combat_training_abilities_target: 34
+      )
+      gs.set_dance_queue
+      expect(gs.instance_variable_get(:@dance_queue)).to eq(%w[hide])
+    end
+
+    it 'falls back to normal dance actions when the stealth list is empty' do
+      gs = build_queue_state(
+        dance_actions_stealth: [],
+        combat_training_abilities_target: 34
+      )
+      gs.set_dance_queue
+      expect(gs.instance_variable_get(:@dance_queue)).to eq(%w[bob weave circle])
+    end
+
+    it 'returns nil from next_dance_action when the queue is empty' do
+      expect(build_queue_state.next_dance_action).to be_nil
+    end
+  end
+end
+
+# ===================================================================
+# GameState charged maneuvers
+#
+# Maneuvers share a per-character cooldown, and @cooldown_timers stores
+# the future ready-time rather than the start time. Off-by-one handling
+# here either wastes maneuvers or spams ones still on cooldown.
+# ===================================================================
+RSpec.describe 'GameState charged maneuvers' do
+  before(:each) { ct_setup }
+
+  def build_maneuver_state(**overrides)
+    gs = GameState.allocate
+    defaults = {
+      use_charged_maneuvers: true,
+      charged_maneuvers: {},
+      cooldown_timers: {},
+      currently_whirlwinding: false,
+      prioritize_maneuver_doublestrike: false,
+      doublestrike_trainables: [],
+      current_weapon_skill: 'Small Edged',
+      rush_shield: nil,
+      rush_engage_only: false
+    }
+    defaults.merge(overrides).each { |k, v| gs.instance_variable_set(:"@#{k}", v) }
+    gs
+  end
+
+  describe '#charged_maneuver_off_cooldown?' do
+    it 'treats a nil maneuver as not off cooldown' do
+      expect(build_maneuver_state.charged_maneuver_off_cooldown?(nil)).to be false
+    end
+
+    it 'is off cooldown when the maneuver has no recorded timer' do
+      expect(build_maneuver_state.charged_maneuver_off_cooldown?('Vault Kick')).to be true
+    end
+
+    it 'is on cooldown while the stored ready-time is in the future' do
+      gs = build_maneuver_state(cooldown_timers: { 'vault kick' => Time.now + 60 })
+      expect(gs.charged_maneuver_off_cooldown?('Vault Kick')).to be false
+    end
+
+    it 'is off cooldown once the stored ready-time has passed' do
+      gs = build_maneuver_state(cooldown_timers: { 'vault kick' => Time.now - 1 })
+      expect(gs.charged_maneuver_off_cooldown?('Vault Kick')).to be true
+    end
+
+    # The timer keys are downcased on write, so lookup must downcase too --
+    # otherwise every maneuver reads as "no timer" and fires every tick.
+    it 'matches the stored timer case-insensitively' do
+      gs = build_maneuver_state(cooldown_timers: { 'vault kick' => Time.now + 60 })
+      expect(gs.charged_maneuver_off_cooldown?('VAULT KICK')).to be false
+    end
+  end
+
+  describe '#determine_charged_maneuver' do
+    it 'returns nil when charged maneuvers are disabled' do
+      gs = build_maneuver_state(
+        use_charged_maneuvers: false,
+        charged_maneuvers: { 'Small Edged' => 'Vault Kick' }
+      )
+      expect(gs.determine_charged_maneuver).to be_nil
+    end
+
+    it 'picks the maneuver configured for the current weapon skill' do
+      gs = build_maneuver_state(charged_maneuvers: { 'Small Edged' => 'Vault Kick' })
+      expect(gs.determine_charged_maneuver).to eq('Vault Kick')
+    end
+
+    it 'returns nil when nothing is configured for the current weapon skill' do
+      gs = build_maneuver_state(charged_maneuvers: { 'Bow' => 'Precision' })
+      expect(gs.determine_charged_maneuver).to be_nil
+    end
+
+    it 'prefers Dual Wield over the weapon-skill maneuver while whirlwinding' do
+      gs = build_maneuver_state(
+        currently_whirlwinding: true,
+        charged_maneuvers: { 'Dual Wield' => 'Twin Hammerfists', 'Small Edged' => 'Vault Kick' }
+      )
+      expect(gs.determine_charged_maneuver).to eq('Twin Hammerfists')
+    end
+
+    it 'does not pick Dual Wield while whirlwinding with a twohanded weapon' do
+      gs = build_maneuver_state(
+        currently_whirlwinding: true,
+        current_weapon_skill: 'Twohanded Edged',
+        charged_maneuvers: { 'Dual Wield' => 'Twin Hammerfists', 'Twohanded Edged' => 'Vault Kick' }
+      )
+      expect(gs.determine_charged_maneuver).to eq('Vault Kick')
+    end
+
+    it 'falls back to the weapon-skill maneuver when Dual Wield is on cooldown' do
+      gs = build_maneuver_state(
+        currently_whirlwinding: true,
+        charged_maneuvers: { 'Dual Wield' => 'Twin Hammerfists', 'Small Edged' => 'Vault Kick' },
+        cooldown_timers: { 'twin hammerfists' => Time.now + 60 }
+      )
+      expect(gs.determine_charged_maneuver).to eq('Vault Kick')
+    end
+
+    it 'falls back to a shield rush when the weapon maneuver is on cooldown' do
+      $left_hand = nil
+      gs = build_maneuver_state(
+        rush_shield: 'shield',
+        charged_maneuvers: { 'Small Edged' => 'Vault Kick', 'Shield Usage' => 'Shield Rush' },
+        cooldown_timers: { 'vault kick' => Time.now + 60 }
+      )
+      expect(gs.determine_charged_maneuver).to eq('Shield Rush')
+    end
+
+    it 'does not shield rush when the offhand is occupied' do
+      $left_hand = 'parry stick'
+      gs = build_maneuver_state(
+        rush_shield: 'shield',
+        charged_maneuvers: { 'Small Edged' => 'Vault Kick', 'Shield Usage' => 'Shield Rush' },
+        cooldown_timers: { 'vault kick' => Time.now + 60 }
+      )
+      expect(gs.determine_charged_maneuver).to be_nil
+    end
+
+    it 'does not shield rush while training an aimed weapon skill' do
+      $left_hand = nil
+      gs = build_maneuver_state(
+        current_weapon_skill: 'Bow',
+        rush_shield: 'shield',
+        charged_maneuvers: { 'Shield Usage' => 'Shield Rush' }
+      )
+      expect(gs.determine_charged_maneuver).to be_nil
+    end
+
+    it 'does not shield rush when rush is configured for engagement only' do
+      $left_hand = nil
+      gs = build_maneuver_state(
+        rush_shield: 'shield',
+        rush_engage_only: true,
+        charged_maneuvers: { 'Shield Usage' => 'Shield Rush' }
+      )
+      expect(gs.determine_charged_maneuver).to be_nil
+    end
+
+    it 'returns nil when every configured maneuver is on cooldown' do
+      $left_hand = nil
+      gs = build_maneuver_state(
+        rush_shield: 'shield',
+        charged_maneuvers: { 'Small Edged' => 'Vault Kick', 'Shield Usage' => 'Shield Rush' },
+        cooldown_timers: { 'vault kick' => Time.now + 60, 'shield rush' => Time.now + 60 }
+      )
+      expect(gs.determine_charged_maneuver).to be_nil
+    end
+  end
+end
+
+# ===================================================================
+# GameState thrown-weapon verbs
+#
+# Picking the wrong verb either wastes the throw or loses the weapon:
+# a bound weapon must be invoked back rather than picked up off the
+# floor, and a lodging weapon must be lobbed rather than thrown.
+# ===================================================================
+RSpec.describe 'GameState thrown-weapon verbs' do
+  before(:each) { ct_setup }
+
+  def build_thrown_state(bound: false, lodges: false, **overrides)
+    gs = GameState.allocate
+    item = OpenStruct.new(bound: bound, lodges: lodges, swappable: false)
+    equipment_manager = double('EquipmentManager')
+    allow(equipment_manager).to receive(:item_by_desc).and_return(item)
+
+    defaults = {
+      current_weapon_skill: 'Light Thrown',
+      weapons_to_train: { 'Light Thrown' => 'javelin' },
+      attack_overrides: {},
+      use_weak_attacks: false,
+      equipment_manager: equipment_manager
+    }
+    defaults.merge(overrides).each { |k, v| gs.instance_variable_set(:"@#{k}", v) }
+    gs
+  end
+
+  describe '#thrown_attack_verb' do
+    it 'hurls a bound weapon' do
+      expect(build_thrown_state(bound: true).thrown_attack_verb).to eq('hurl')
+    end
+
+    it 'lobs a lodging weapon' do
+      expect(build_thrown_state(lodges: true).thrown_attack_verb).to eq('lob')
+    end
+
+    it 'throws a weapon that is neither bound nor lodging' do
+      expect(build_thrown_state.thrown_attack_verb).to eq('throw')
+    end
+
+    it 'lobs a bound weapon when weak attacks are enabled' do
+      # Weak attacks must beat the bound-weapon hurl so mindstate stays low.
+      expect(build_thrown_state(bound: true, use_weak_attacks: true).thrown_attack_verb).to eq('lob')
+    end
+
+    it 'prefers a configured attack override over every other verb' do
+      gs = build_thrown_state(bound: true, attack_overrides: { 'Light Thrown' => 'sling' })
+      expect(gs.thrown_attack_verb).to eq('sling')
+    end
+
+    # A weapon the equipment manager does not know about is assumed to lodge,
+    # so it is lobbed rather than thrown out of reach.
+    it 'treats an unknown weapon as lodging' do
+      gs = build_thrown_state
+      equipment_manager = double('EquipmentManager')
+      allow(equipment_manager).to receive(:item_by_desc).and_return(nil)
+      gs.instance_variable_set(:@equipment_manager, equipment_manager)
+      expect(gs.thrown_attack_verb).to eq('lob')
+    end
+  end
+
+  describe '#thrown_retrieve_verb' do
+    it 'invokes a bound weapon back to hand' do
+      expect(build_thrown_state(bound: true).thrown_retrieve_verb).to eq('invoke')
+    end
+
+    it 'picks an unbound weapon up by name' do
+      expect(build_thrown_state.thrown_retrieve_verb).to eq('get my javelin')
+    end
+
+    it 'picks an unknown weapon up by name rather than invoking it' do
+      gs = build_thrown_state
+      equipment_manager = double('EquipmentManager')
+      allow(equipment_manager).to receive(:item_by_desc).and_return(nil)
+      gs.instance_variable_set(:@equipment_manager, equipment_manager)
+      expect(gs.thrown_retrieve_verb).to eq('get my javelin')
+    end
+  end
+end
+
+# ===================================================================
+# GameState action counter
+#
+# @action_count drives skill_done? when ignore_weapon_mindstate is set,
+# so drift here changes how long a weapon is trained.
+# ===================================================================
+RSpec.describe 'GameState action counter' do
+  before(:each) { ct_setup }
+
+  def build_counter_state(action_count: 0)
+    gs = GameState.allocate
+    gs.instance_variable_set(:@action_count, action_count)
+    gs
+  end
+
+  it 'increments by one by default' do
+    gs = build_counter_state
+    gs.action_taken
+    expect(gs.action_count).to eq(1)
+  end
+
+  it 'increments by an explicit count' do
+    gs = build_counter_state
+    gs.action_taken(5)
+    expect(gs.action_count).to eq(5)
+  end
+
+  it 'accumulates across repeated calls' do
+    gs = build_counter_state
+    3.times { gs.action_taken }
+    gs.action_taken(2)
+    expect(gs.action_count).to eq(5)
+  end
+
+  it 'reduces by an explicit count' do
+    gs = build_counter_state(action_count: 10)
+    gs.action_reduce(4)
+    expect(gs.action_count).to eq(6)
+  end
+
+  # Nothing clamps the counter, so an over-reduction goes negative and
+  # silently extends training past the configured target_action_count.
+  it 'goes negative when reduced below zero' do
+    gs = build_counter_state(action_count: 1)
+    gs.action_reduce(3)
+    expect(gs.action_count).to eq(-2)
+  end
+
+  it 'resets to zero regardless of the accumulated count' do
+    gs = build_counter_state(action_count: 42)
+    gs.reset_action_count
+    expect(gs.action_count).to eq(0)
+  end
+end
+
+# ===================================================================
+# LootProcess -- necromancer ritual corpse targeting
+#
+# Rituals used to be aimed at the bare noun from DRRoom.dead_npcs, which
+# is ambiguous the moment two same-noun corpses share a room. Unless an
+# example says otherwise the room below holds two 'rat' corpses that
+# differ only by id, so a command built from the noun could not tell
+# them apart:
+# every perform/butcher must address the selected corpse by '#<id>'.
+# Only the operator-facing diagnostics still name the corpse, falling
+# back to the noun when the creature has no name yet.
+# ===================================================================
+RSpec.describe LootProcess do
+  before(:each) do
+    ct_setup
+    DRStats.guild = 'Necromancer'
+    Lich::DragonRealms::Creature._set_room([selected_corpse, other_corpse])
+    allow(DRC).to receive(:bput) { |command, *_matchers| record_bput(command) }
+    allow(DRC).to receive(:message)
+  end
+
+  # Same noun, different ids -- the whole point of the id targeting.
+  let(:selected_corpse) { OpenStruct.new(id: 111, noun: 'rat', name: 'a giant rat') }
+  let(:other_corpse) { OpenStruct.new(id: 222, noun: 'rat', name: 'a giant rat') }
+
+  let(:rituals) do
+    {
+      'preserve'  => 'suspending the corpse in unnatural stasis',
+      'harvest'   => 'a few quick, precise motions with your ritual knife',
+      'dissect'   => 'Using your knife as a probe',
+      'consume'   => 'a few quick, precise cuts with your ritual knife',
+      'arise'     => 'carefully carve a ritual design across a handspan of its body',
+      'construct' => 'Rituals do not work upon constructs',
+      'butcher'   => 'Making several deep cuts with your knife',
+      'failures'  => ['You do not have the knowledge required to perform this ritual']
+    }
+  end
+
+  # Commands the script sent, in order, so each example can assert both
+  # what was targeted and that the noun never leaked into a command.
+  let(:sent_commands) { [] }
+  # Per-command canned game responses; anything unlisted answers with the
+  # matching ritual message so the happy path runs to completion.
+  let(:bput_responses) { {} }
+
+  def record_bput(command)
+    sent_commands << command
+    return bput_responses[command] if bput_responses.key?(command)
+
+    case command
+    when /^perform preserve/ then rituals['preserve']
+    when /^perform butcher/  then rituals['butcher']
+    when /^perform dissect/  then rituals['dissect']
+    when /^perform arise/    then rituals['arise']
+    else 'Roundtime'
+    end
+  end
+
+  def perform_commands
+    sent_commands.grep(/^perform /)
+  end
+
+  def build_necro_loot(**overrides)
+    lp = LootProcess.allocate
+    defaults = {
+      rituals: rituals, last_ritual: nil, ritual_type: 'butcher',
+      necro_corpse_priority: 'heal', necro_heal: false,
+      make_zombie: false, make_bonebug: false,
+      redeemed: false, cycle_rituals: false, force_rituals: false,
+      current_harvest_count: 0, necro_count: 0,
+      dissect_and_butcher: true, butcher_count: 2, necro_store: false,
+      equipment_manager: double('EquipmentManager', stow_weapon: nil, wield_weapon?: nil)
+    }
+    defaults.merge(overrides).each { |k, v| lp.instance_variable_set(:"@#{k}", v) }
+    lp
+  end
+
+  def necro_game_state(construct: false)
+    state = double('GameState', necro_casting?: false, cfb_active?: false, cfw_active?: false,
+                                weapon_name: 'javelin', weapon_skill: 'Polearms')
+    allow(state).to receive(:construct?).and_return(construct)
+    allow(state).to receive(:construct)
+    allow(state).to receive(:prepare_nr=)
+    allow(state).to receive(:prepare_cfb=)
+    allow(state).to receive(:prepare_cfw=)
+    allow(state).to receive(:prepare_consume=)
+    state
+  end
+
+  describe '#check_rituals? with two same-noun corpses in the room' do
+    it 'asks the creature registry for dead creatures' do
+      build_necro_loot.check_rituals?(necro_game_state)
+
+      expect(Lich::DragonRealms::Creature._in_room_filters).to include([:dead])
+    end
+
+    it 'targets preserve, every butcher and the final dissect at the selected corpse id' do
+      build_necro_loot(ritual_type: 'butcher', dissect_and_butcher: true, butcher_count: 2)
+        .check_rituals?(necro_game_state)
+
+      expect(perform_commands).to eq(
+        [
+          'perform preserve on #111',
+          'perform butcher on #111',
+          'perform butcher on #111',
+          'perform dissect on #111'
+        ]
+      )
+    end
+
+    it 'never addresses a corpse by noun, nor the other same-noun corpse' do
+      build_necro_loot(ritual_type: 'butcher', dissect_and_butcher: true, butcher_count: 2)
+        .check_rituals?(necro_game_state)
+
+      expect(sent_commands.grep(/rat/)).to be_empty
+      expect(sent_commands.grep(/#222/)).to be_empty
+    end
+
+    it 'targets the selected corpse id for a non-butcher ritual and its preserve' do
+      # Mindstates full, so the configured ritual is skipped and only the
+      # zombie-raising arise (with its preserve) runs. Stubbed per-example
+      # rather than seeded with DRSkill._set_xp: outdoorsmanship_spec swaps
+      # the harness xp store for one reset_data does not clear, so a seeded
+      # value leaks into later examples in a full-suite run.
+      allow(DRSkill).to receive(:getxp).and_return(34)
+
+      build_necro_loot(ritual_type: 'dissect', dissect_and_butcher: false, make_zombie: true)
+        .check_rituals?(necro_game_state)
+
+      expect(perform_commands).to eq(['perform preserve on #111', 'perform arise on #111'])
+    end
+
+    it 'sends nothing when the room holds no corpse' do
+      Lich::DragonRealms::Creature._set_room([])
+
+      expect(build_necro_loot.check_rituals?(necro_game_state)).to be true
+      expect(perform_commands).to be_empty
+    end
+
+    it 'skips a corpse the game state already knows is a construct' do
+      game_state = necro_game_state(construct: true)
+
+      expect(build_necro_loot.check_rituals?(game_state)).to be true
+      expect(game_state).to have_received(:construct?).with('rat')
+      expect(perform_commands).to be_empty
+    end
+  end
+
+  describe 'wrong/missing corpse diagnostics' do
+    it 'reports the corpse name and id when a perform misses its target' do
+      bput_responses['perform dissect on #111'] = 'What were you referring to'
+
+      build_necro_loot(ritual_type: 'dissect', dissect_and_butcher: false)
+        .check_rituals?(necro_game_state)
+
+      expect(DRC).to have_received(:message)
+        .with("*** combat-trainer: dissect failed - wrong/missing corpse target (tried 'a giant rat' #111)")
+    end
+
+    it 'falls back to the noun when the corpse has no name yet' do
+      selected_corpse.name = nil
+      bput_responses['perform dissect on #111'] = 'What were you referring to'
+
+      build_necro_loot(ritual_type: 'dissect', dissect_and_butcher: false)
+        .check_rituals?(necro_game_state)
+
+      expect(DRC).to have_received(:message)
+        .with("*** combat-trainer: dissect failed - wrong/missing corpse target (tried 'rat' #111)")
+    end
+
+    it 'reports the corpse and skips the dissect when a butcher misses its target' do
+      bput_responses['perform butcher on #111'] = 'I could not find what you were referring to'
+
+      build_necro_loot(ritual_type: 'butcher', dissect_and_butcher: true, butcher_count: 2)
+        .check_rituals?(necro_game_state)
+
+      expect(DRC).to have_received(:message)
+        .with("*** combat-trainer: butcher failed - wrong/missing corpse target (tried 'a giant rat' #111)")
+      expect(perform_commands).to eq(['perform preserve on #111', 'perform butcher on #111'])
+    end
+  end
+end
+
+# ===================================================================
+# LootProcess -- dead-body targeting by creature id (non-necro path)
+#
+# `dissect` and last-rites `pray` used to interpolate the bare noun from
+# DRRoom.dead_npcs, which can bind to a LIVE same-noun mob that wandered
+# in between the kill and the dissect (dissect then fails on the living
+# creature). They now address the specific dead body by its stable
+# <crtrStatus> id, selected from Creature.in_room(:dead).
+# ===================================================================
+RSpec.describe LootProcess do
+  before(:each) do
+    ct_setup
+    allow(DRC).to receive(:message)
+  end
+
+  let(:corpse) { OpenStruct.new(id: 111, noun: 'rat', name: 'a giant rat') }
+
+  def dissect_game_state
+    state = double('GameState')
+    allow(state).to receive(:dissectable?).and_return(true)
+    allow(state).to receive(:construct)
+    allow(state).to receive(:undissectable)
+    state
+  end
+
+  def build_dissect_loot(**overrides)
+    lp = LootProcess.allocate
+    defaults = { dissect: true, skin: false, dissect_for_thanatology: false, dissect_cycle_skills: [], dissected_corpse_ids: [] }
+    defaults.merge(overrides).each { |k, v| lp.instance_variable_set(:"@#{k}", v) }
+    lp
+  end
+
+  describe '#dissected?' do
+    before(:each) { allow(DRSkill).to receive(:getxp).and_return(0) }
+
+    it 'addresses the corpse by id, never by noun' do
+      allow(DRC).to receive(:bput).and_return('You succeed in dissecting the corpse')
+      build_dissect_loot.send(:dissected?, corpse, dissect_game_state)
+      expect(DRC).to have_received(:bput).with('dissect #111', any_args)
+      expect(DRC).not_to have_received(:bput).with('dissect rat', any_args)
+    end
+
+    it 'falls back to a bare dissect for the nil-corpse retry' do
+      allow(DRC).to receive(:bput).and_return('You succeed in dissecting the corpse')
+      build_dissect_loot.send(:dissected?, nil, dissect_game_state)
+      expect(DRC).to have_received(:bput).with('dissect', any_args)
+    end
+
+    it 'retries with a bare dissect when the corpse "would probably object"' do
+      responses = ['would probably object', 'You succeed in dissecting the corpse']
+      allow(DRC).to receive(:bput) { responses.shift }
+      build_dissect_loot.send(:dissected?, corpse, dissect_game_state)
+      expect(DRC).to have_received(:bput).with('dissect #111', any_args)
+      expect(DRC).to have_received(:bput).with('dissect', any_args)
+    end
+
+    it 'marks a construct by noun when rituals do not work on it' do
+      allow(DRC).to receive(:bput).and_return('Rituals do not work upon constructs')
+      gs = dissect_game_state
+      expect(gs).to receive(:construct).with('rat')
+      expect(gs).to receive(:undissectable).with('rat')
+      build_dissect_loot.send(:dissected?, corpse, gs)
+    end
+
+    # name-less crtrStatus window: id present, noun not yet. We still dissect by
+    # id, and never pollute the species memory with a nil noun.
+    it 'does not construct-mark a nil-noun corpse' do
+      allow(DRC).to receive(:bput).and_return('Rituals do not work upon constructs')
+      nameless = OpenStruct.new(id: 55, noun: nil, name: nil)
+      gs = dissect_game_state
+      build_dissect_loot.send(:dissected?, nameless, gs)
+      expect(DRC).to have_received(:bput).with('dissect #55', any_args)
+      expect(gs).not_to have_received(:construct)
+      expect(gs).not_to have_received(:undissectable)
+    end
+
+    # A dissected corpse lingers dead in the roster until decay; track the id so
+    # we don't re-fire dissect at it every pass.
+    it 'records the corpse id on a successful dissect' do
+      allow(DRC).to receive(:bput).and_return('You succeed in dissecting the corpse')
+      lp = build_dissect_loot
+      lp.send(:dissected?, corpse, dissect_game_state)
+      expect(lp.instance_variable_get(:@dissected_corpse_ids)).to include(111)
+    end
+
+    it 'reports dissected without re-firing for an already-dissected corpse' do
+      allow(DRC).to receive(:bput)
+      lp = build_dissect_loot(dissected_corpse_ids: [corpse.id])
+      expect(lp.send(:dissected?, corpse, dissect_game_state)).to be true
+      expect(DRC).not_to have_received(:bput).with(/\Adissect/, any_args)
+    end
+  end
+
+  def build_dispose_loot(**overrides)
+    lp = LootProcess.allocate
+    defaults = {
+      loot_bodies: true, loot_timer: Time.now - 100, loot_delay: 0,
+      last_rites: true, last_rites_timer: Time.now - 700, custom_loot_type: '',
+      looted_corpse_ids: [], skinned_corpse_ids: [], dissected_corpse_ids: []
+    }
+    defaults.merge(overrides).each { |k, v| lp.instance_variable_set(:"@#{k}", v) }
+    lp
+  end
+
+  describe '#dispose_body' do
+    it 'prays over the corpse by id for last rites' do
+      DRRoom.dead_npcs = ['rat']
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('You pray fervently')
+      gs = double('GameState', blessed_room: true)
+      allow(gs).to receive(:mob_died=)
+      build_dispose_loot.dispose_body(gs)
+      expect(DRC).to have_received(:bput).with('pray #111', any_args)
+    end
+
+    # DRRoom says a body is present, but no id is available yet (roster divergence
+    # / name-less window). We must NOT fall back to the noun -- that reintroduces
+    # the live/dead collision -- so we skip dead-body actions this tick.
+    it 'skips pray/dissect when no corpse id is available' do
+      DRRoom.dead_npcs = ['rat']
+      Lich::DragonRealms::Creature._set_room([])
+      allow(DRC).to receive(:bput).and_return('Roundtime')
+      gs = double('GameState', blessed_room: true, necro_casting?: false)
+      allow(gs).to receive(:mob_died=)
+      allow(gs).to receive(:sheath_whirlwind_offhand)
+      allow(gs).to receive(:wield_whirlwind_offhand)
+      build_dispose_loot.dispose_body(gs)
+      expect(DRC).not_to have_received(:bput).with(/\Apray /, any_args)
+      expect(DRC).not_to have_received(:bput).with(/\Adissect/, any_args)
+    end
+
+    # Loot the exact corpse we processed by its id -- a looted corpse vanishes
+    # shortly after, so a bare LOOT can bind to the wrong/absent body.
+    it 'loots the corpse by its id, keeping the configured loot type' do
+      DRRoom.dead_npcs = ['rat']
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('You search')
+      gs = double('GameState', blessed_room: false, necro_casting?: false)
+      allow(gs).to receive(:mob_died=)
+      allow(gs).to receive(:sheath_whirlwind_offhand)
+      allow(gs).to receive(:wield_whirlwind_offhand)
+      lp = build_dispose_loot(custom_loot_type: 'treasure')
+      allow(lp).to receive(:check_rituals?).and_return(false)
+      lp.dispose_body(gs)
+      expect(DRC).to have_received(:bput).with('loot #111 treasure', any_args)
+    end
+
+    it 'omits the loot-type token when none is configured' do
+      DRRoom.dead_npcs = ['rat']
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('You search')
+      gs = double('GameState', blessed_room: false, necro_casting?: false)
+      allow(gs).to receive(:mob_died=)
+      allow(gs).to receive(:sheath_whirlwind_offhand)
+      allow(gs).to receive(:wield_whirlwind_offhand)
+      lp = build_dispose_loot
+      allow(lp).to receive(:check_rituals?).and_return(false)
+      lp.dispose_body(gs)
+      expect(DRC).to have_received(:bput).with('loot #111', any_args)
+    end
+
+    it 'records the corpse id after looting it' do
+      DRRoom.dead_npcs = ['rat']
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('You search')
+      gs = double('GameState', blessed_room: false, necro_casting?: false)
+      allow(gs).to receive(:mob_died=)
+      allow(gs).to receive(:sheath_whirlwind_offhand)
+      allow(gs).to receive(:wield_whirlwind_offhand)
+      lp = build_dispose_loot
+      allow(lp).to receive(:check_rituals?).and_return(false)
+      lp.dispose_body(gs)
+      expect(lp.instance_variable_get(:@looted_corpse_ids)).to include(111)
+    end
+
+    # Group hunt: a teammate searches the corpse first, so loot-by-id gets
+    # "The <mob> has already been searched for that!". That must be a matcher, or
+    # bput hangs the full 15s mid-combat. Terminal -> loop exits, corpse marked.
+    it 'treats "already been searched" as terminal loot and marks the corpse looted' do
+      DRRoom.dead_npcs = ['rat']
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('already been searched')
+      gs = double('GameState', blessed_room: false, necro_casting?: false)
+      allow(gs).to receive(:mob_died=)
+      allow(gs).to receive(:sheath_whirlwind_offhand)
+      allow(gs).to receive(:wield_whirlwind_offhand)
+      lp = build_dispose_loot
+      allow(lp).to receive(:check_rituals?).and_return(false)
+      lp.dispose_body(gs)
+      expect(DRC).to have_received(:bput).with('loot #111', 'You search', 'I could not find what you were referring to', 'and get ready to search it', 'already been searched')
+      expect(lp.instance_variable_get(:@looted_corpse_ids)).to include(111)
+    end
+
+    # A looted corpse lingers dead in the roster until decay; don't re-search it.
+    it 'does not re-loot a corpse already recorded as looted' do
+      DRRoom.dead_npcs = ['rat']
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('You search')
+      gs = double('GameState', blessed_room: false, necro_casting?: false)
+      allow(gs).to receive(:mob_died=)
+      allow(gs).to receive(:sheath_whirlwind_offhand)
+      allow(gs).to receive(:wield_whirlwind_offhand)
+      lp = build_dispose_loot(looted_corpse_ids: [corpse.id])
+      allow(lp).to receive(:check_rituals?).and_return(false)
+      lp.dispose_body(gs)
+      expect(DRC).not_to have_received(:bput).with(/\Aloot/, any_args)
+    end
+
+    # Regression: a looted corpse lingers dead in the roster (~6-7s until decay),
+    # and the roster is oldest-id-first, so it sits at the head. dispose_body used
+    # to act only on the roster's first corpse and skip when it was already
+    # looted -- so a stale looted body at the head blocked every newer corpse
+    # behind it until it decayed (one loot per decay window). We must skip the
+    # looted head and loot the next un-looted corpse the same pass.
+    it 'skips a lingering looted corpse and loots the next un-looted one the same pass' do
+      fresh = OpenStruct.new(id: 222, noun: 'rat', name: 'a giant rat')
+      DRRoom.dead_npcs = %w[rat rat]
+      Lich::DragonRealms::Creature._set_room([corpse, fresh])
+      allow(DRC).to receive(:bput).and_return('You search')
+      gs = double('GameState', blessed_room: false, necro_casting?: false)
+      allow(gs).to receive(:mob_died=)
+      allow(gs).to receive(:sheath_whirlwind_offhand)
+      allow(gs).to receive(:wield_whirlwind_offhand)
+      lp = build_dispose_loot(looted_corpse_ids: [corpse.id])
+      allow(lp).to receive(:check_rituals?).and_return(false)
+      lp.dispose_body(gs)
+      expect(DRC).to have_received(:bput).with('loot #222', any_args)
+      expect(DRC).not_to have_received(:bput).with('loot #111', any_args)
+      expect(lp.instance_variable_get(:@looted_corpse_ids)).to include(222)
+    end
+
+    # The all-looted no-op must not fall back to a bare LOOT: with every roster
+    # corpse already searched, a bare `loot` would re-search a decaying body
+    # every tick. (A genuinely empty roster still uses the bare-loot fallback --
+    # covered by 'skips pray/dissect when no corpse id is available'.)
+    it 'issues no loot command when every roster corpse is already looted' do
+      other = OpenStruct.new(id: 222, noun: 'rat', name: 'a giant rat')
+      DRRoom.dead_npcs = %w[rat rat]
+      Lich::DragonRealms::Creature._set_room([corpse, other])
+      allow(DRC).to receive(:bput).and_return('You search')
+      gs = double('GameState', blessed_room: false, necro_casting?: false)
+      allow(gs).to receive(:mob_died=)
+      allow(gs).to receive(:sheath_whirlwind_offhand)
+      allow(gs).to receive(:wield_whirlwind_offhand)
+      lp = build_dispose_loot(looted_corpse_ids: [corpse.id, other.id])
+      allow(lp).to receive(:check_rituals?).and_return(false)
+      lp.dispose_body(gs)
+      expect(DRC).not_to have_received(:bput).with(/\Aloot/, any_args)
+    end
+
+    # Regression: the all-looted early return must reset @loot_timer like every
+    # other exit that gets past the loot-delay gate, so @loot_delay throttles it.
+    # Without the reset, at loot_delay > 0 the prune + selection re-ran every tick
+    # while already-looted corpses lingered instead of once per loot_delay.
+    it 'resets the loot timer on the all-looted early return so the delay gate throttles it' do
+      other = OpenStruct.new(id: 222, noun: 'rat', name: 'a giant rat')
+      DRRoom.dead_npcs = %w[rat rat]
+      Lich::DragonRealms::Creature._set_room([corpse, other])
+      allow(DRC).to receive(:bput).and_return('You search')
+      gs = double('GameState', blessed_room: false, necro_casting?: false)
+      allow(gs).to receive(:mob_died=)
+      allow(gs).to receive(:sheath_whirlwind_offhand)
+      allow(gs).to receive(:wield_whirlwind_offhand)
+      lp = build_dispose_loot(looted_corpse_ids: [corpse.id, other.id], loot_timer: Time.now - 100)
+      allow(lp).to receive(:check_rituals?).and_return(false)
+      lp.dispose_body(gs)
+      expect(lp.instance_variable_get(:@loot_timer)).to be_within(2).of(Time.now)
+    end
+
+    # The action trackers must stay bounded to the current room. Every pulse
+    # rebuilds the dead roster, so an id we recorded that is no longer present
+    # belongs to a decayed corpse and is dropped -- otherwise the lists grow for
+    # the whole session. Ids still present are kept so we don't re-act on them.
+    it 'prunes tracked corpse ids that are no longer in the dead roster' do
+      DRRoom.dead_npcs = ['rat']
+      # Only #111 is still present; 999/888/777 are ids of corpses that decayed.
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('You search')
+      gs = double('GameState', blessed_room: false, necro_casting?: false)
+      allow(gs).to receive(:mob_died=)
+      allow(gs).to receive(:sheath_whirlwind_offhand)
+      allow(gs).to receive(:wield_whirlwind_offhand)
+      lp = build_dispose_loot(
+        looted_corpse_ids: [corpse.id, 999],
+        skinned_corpse_ids: [corpse.id, 888],
+        dissected_corpse_ids: [777]
+      )
+      allow(lp).to receive(:check_rituals?).and_return(false)
+      lp.dispose_body(gs)
+      expect(lp.instance_variable_get(:@looted_corpse_ids)).to eq([corpse.id])
+      expect(lp.instance_variable_get(:@skinned_corpse_ids)).to eq([corpse.id])
+      expect(lp.instance_variable_get(:@dissected_corpse_ids)).to eq([])
+    end
+  end
+
+  describe 'corpse-existence gates' do
+    def gate_game_state
+      gs = double('GameState')
+      allow(gs).to receive(:skinnable?).and_return(true)
+      allow(gs).to receive(:necro_casting?).and_return(false)
+      allow(gs).to receive(:need_bundle).and_return(false)
+      gs
+    end
+
+    def build_gate_loot
+      lp = LootProcess.allocate
+      { skin: true, arrange_for_dissect: true, arrange_count: 1, arrange_all: false,
+        arrange_types: {}, tie_bundle: false, skinned_corpse_ids: [] }.each { |k, v| lp.instance_variable_set(:"@#{k}", v) }
+      lp
+    end
+
+    it 'arrange_mob does nothing once the corpse has left the room (looted/decayed)' do
+      Lich::DragonRealms::Creature._set_room([])
+      allow(DRC).to receive(:bput)
+      build_gate_loot.send(:arrange_mob, 'rat', gate_game_state, corpse)
+      expect(DRC).not_to have_received(:bput)
+    end
+
+    it 'arrange_mob targets the corpse by id while it is still present' do
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('You complete arranging')
+      build_gate_loot.send(:arrange_mob, 'rat', gate_game_state, corpse)
+      expect(DRC).to have_received(:bput).with('arrange #111 for skin', any_args)
+    end
+
+    it 'arrange_mob keeps the id target in the all-variant' do
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('You complete arranging')
+      lp = build_gate_loot
+      lp.instance_variable_set(:@arrange_all, true)
+      lp.send(:arrange_mob, 'rat', gate_game_state, corpse)
+      expect(DRC).to have_received(:bput).with('arrange all #111 for skin', any_args)
+    end
+
+    # "That creature cannot" be arranged for that type -> retry generically, but
+    # still against the same corpse id (not a bare arrange).
+    it 'arrange_mob retries the id target without the type clause' do
+      Lich::DragonRealms::Creature._set_room([corpse])
+      responses = ['That creature cannot', 'You complete arranging']
+      allow(DRC).to receive(:bput) { responses.shift }
+      build_gate_loot.send(:arrange_mob, 'rat', gate_game_state, corpse)
+      expect(DRC).to have_received(:bput).with('arrange #111', any_args)
+    end
+
+    it 'check_skinning does nothing once the corpse has left the room' do
+      Lich::DragonRealms::Creature._set_room([])
+      allow(DRC).to receive(:bput)
+      build_gate_loot.send(:check_skinning, 'rat', gate_game_state, corpse)
+      expect(DRC).not_to have_received(:bput)
+    end
+
+    it 'check_skinning targets the corpse by id while it is still present' do
+      Lich::DragonRealms::Creature._set_room([corpse])
+      # DRC.bput returns the matched substring from the game line ("Roundtime"),
+      # not the matcher -- stub it realistically so the case-insensitive branch
+      # is exercised.
+      allow(DRC).to receive(:bput).and_return('Roundtime')
+      build_gate_loot.send(:check_skinning, 'rat', gate_game_state, corpse)
+      expect(DRC).to have_received(:bput).with('skin #111', any_args)
+    end
+
+    # A looted corpse lingers dead in the roster for ~6-7s until it decays, so
+    # corpse_present? stays true; per-id tracking is what stops the redundant
+    # arrange/skin passes ("...already been skinned, there's no point.").
+    it 'check_skinning records the corpse id after a successful skin' do
+      Lich::DragonRealms::Creature._set_room([corpse])
+      # Realistic bput return: the matched substring from "Roundtime: 2 sec.".
+      # (A stub of 'roundtime' would mask a regression to `when 'roundtime'`.)
+      allow(DRC).to receive(:bput).and_return('Roundtime')
+      lp = build_gate_loot
+      lp.send(:check_skinning, 'rat', gate_game_state, corpse)
+      expect(lp.instance_variable_get(:@skinned_corpse_ids)).to include(111)
+    end
+
+    it 'check_skinning records the id and stops on "already been skinned"' do
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('already been skinned')
+      lp = build_gate_loot
+      lp.send(:check_skinning, 'rat', gate_game_state, corpse)
+      expect(lp.instance_variable_get(:@skinned_corpse_ids)).to include(111)
+    end
+
+    it 'check_skinning does not re-skin a corpse already recorded as skinned' do
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput)
+      lp = build_gate_loot
+      lp.instance_variable_set(:@skinned_corpse_ids, [corpse.id])
+      lp.send(:check_skinning, 'rat', gate_game_state, corpse)
+      expect(DRC).not_to have_received(:bput).with(/\Askin/, any_args)
+    end
+
+    it 'arrange_mob skips a corpse already recorded as skinned' do
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput)
+      lp = build_gate_loot
+      lp.instance_variable_set(:@skinned_corpse_ids, [corpse.id])
+      lp.send(:arrange_mob, 'rat', gate_game_state, corpse)
+      expect(DRC).not_to have_received(:bput)
+    end
+
+    it 'arrange_mob records the id and stops on "already been skinned"' do
+      Lich::DragonRealms::Creature._set_room([corpse])
+      allow(DRC).to receive(:bput).and_return('already been skinned')
+      lp = build_gate_loot
+      lp.send(:arrange_mob, 'rat', gate_game_state, corpse)
+      expect(lp.instance_variable_get(:@skinned_corpse_ids)).to include(111)
     end
   end
 end

@@ -278,6 +278,8 @@ cast_messages:
 - Sutures of reddish-black energy delve deep
 - Tears of hot regret flow down your eyes
 - Your eyes flare with a whorl
+# Prosperity in Absentia raising a new kiosk
+- ^Your \w+ grows cold
 
 khri_preps:
 - Releasing a deep breath, you focus on your ability to survive the
@@ -3244,6 +3246,14 @@ spell_data:
     recast: 1
     mana_type: lunar
     prep: prepare
+  Prosperity in Absentia:
+    abbrev: PRIA
+    mana: 30
+    skill: Utility
+    guild: Trader
+    recast: 1
+    mana_type: lunar
+    prep: prepare
   Prosperity in Darkness:
     abbrev: PRDA
     guild: Trader
@@ -3447,6 +3457,7 @@ spell_data:
     guild: Warrior Mage
     mana_type: elemental
     prep: prepare # This is a buff that trains TM, you 'spit' to use it
+    expire: Your throat contracts suddenly, growing cooler as your Dragon's Breath spell dissipates. # for combat-trainer rebuffing when consumed
   Electric Charge:
     skill: cantrip
     abbrev: C E C
